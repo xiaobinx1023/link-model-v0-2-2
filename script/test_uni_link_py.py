@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from pickle import TRUE
 import sys
 from typing import Callable
 
@@ -13,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src_py.link_model import Pattern
+from src_py.link_model.driver import Driver
 from src_py_uni.uni_link_model import UniDirLink
 
 
@@ -20,7 +20,9 @@ def _get_monitor_definitions() -> dict[str, tuple[str, Callable[[UniDirLink], fl
     return {
         "tx_drv_out": ("TX driver out", lambda lk: float(lk.tx_drv_out)),
         "tx_to_chan": ("TX -> channel", lambda lk: float(lk.tx_to_chan)),
+        "rx_xtalk_bump": ("RX bump (xtalk only)", lambda lk: float(lk.rx_xtalk_bump)),
         "rx_bump": ("RX bump node", lambda lk: float(lk.rx_bump)),
+        "rx_xtalk_in": ("RX in (xtalk only)", lambda lk: float(lk.rx_xtalk_in)),
         "rx_in_pre_ctle": ("RX in (pre-CTLE)", lambda lk: float(lk.rx_in)),
         "rx_post_ctle": ("RX post-CTLE", lambda lk: float(lk.rx.din_ctle)),
         "rx_post_dfe": ("RX post-DFE", lambda lk: float(lk.rx.din_eq)),
@@ -158,9 +160,14 @@ def run_1ui_pulse_response(
     pulse_end_ns = pulse_end / link.SAMP_FREQ_HZ * 1e9
 
     saved_pattern = Pattern(link.tx_pattern)
+    saved_aggr_enable = bool(link.aggressor_enable)
+    saved_aggr_src = dict(link.aggressor_port_src)
     traces_raw: dict[str, list[float]] = {k: [] for k, _, _ in monitors}
 
     try:
+        link.set_aggressor_enable(False)
+        if link.aggressor_ports:
+            link.set_aggressor_sources({p: 0.0 for p in link.aggressor_ports})
         for t in range(total_cycles):
             link.tx_pattern = Pattern.ALL_ONES if pulse_start <= t < pulse_end else Pattern.ALL_ZEROS
             link.run()
@@ -168,6 +175,9 @@ def run_1ui_pulse_response(
                 traces_raw[key].append(float(getter(link)))
     finally:
         link.tx_pattern = saved_pattern
+        link.set_aggressor_enable(saved_aggr_enable)
+        if link.aggressor_ports:
+            link.set_aggressor_sources({p: float(saved_aggr_src.get(p, 0.0)) for p in link.aggressor_ports})
 
     traces = {k: np.asarray(v, dtype=np.float64) for k, v in traces_raw.items()}
     monitor_order = [k for k, _, _ in monitors]
@@ -211,36 +221,71 @@ def run_1ui_pulse_response(
     }
 
 
-def run_prbs(link: UniDirLink, num_cycles: int = 20000) -> dict[str, np.ndarray]:
+def run_prbs(
+    link: UniDirLink,
+    num_cycles: int = 20000,
+    with_aggressors: bool = False,
+    aggressor_amplitude: float = Driver.AVDD,
+    aggressor_seed: int = 20260304,
+) -> dict[str, np.ndarray]:
     link.tx_pattern = Pattern.PRBS31
+    link.set_aggressor_enable(bool(with_aggressors))
+
     rx_in = np.zeros(num_cycles, dtype=np.float64)
+    rx_xtalk_bump = np.zeros(num_cycles, dtype=np.float64)
+    rx_xtalk_in = np.zeros(num_cycles, dtype=np.float64)
     rx_post_ctle = np.zeros(num_cycles, dtype=np.float64)
     rx_post_ap = np.zeros(num_cycles, dtype=np.float64)
     rx_data_edges: list[int] = []
     tx_data_edges: list[int] = []
+    rx_pi_code: list[int] = []
+    rx_pd_out: list[int] = []
+
+    rng = np.random.default_rng(int(aggressor_seed))
+    aggr_src = {p: 0.0 for p in link.aggressor_ports}
+    if link.aggressor_ports:
+        link.set_aggressor_sources(aggr_src)
 
     for i in range(num_cycles):
+        if link.aggressor_ports:
+            link.set_aggressor_sources(aggr_src)
         link.run()
+
         rx_in[i] = float(link.rx_in)
+        rx_xtalk_bump[i] = float(link.rx_xtalk_bump)
+        rx_xtalk_in[i] = float(link.rx_xtalk_in)
         rx_post_ctle[i] = float(link.rx.din_ctle)
         rx_post_ap[i] = float(link.rx.din_apertured)
 
         if link.tx_pi.clk_out.is_edge:
             tx_data_edges.append(int(link.tx.data_center))
+            if with_aggressors and link.aggressor_ports:
+                aggr_src = {
+                    p: float(aggressor_amplitude) * float(rng.integers(0, 2))
+                    for p in link.aggressor_ports
+                }
+            elif link.aggressor_ports:
+                aggr_src = {p: 0.0 for p in link.aggressor_ports}
+
         if link.rx_pi.clk_out.is_edge:
             rx_data_edges.append(int(link.rx.data))
+            rx_pi_code.append(int(link.rx.pi_code))
+            rx_pd_out.append(int(link.rx._pd_out))
 
     return {
         "rx_in": rx_in,
+        "rx_xtalk_bump": rx_xtalk_bump,
+        "rx_xtalk_in": rx_xtalk_in,
         "rx_post_ctle": rx_post_ctle,
         "rx_post_aperture": rx_post_ap,
         "tx_bits_at_edges": np.asarray(tx_data_edges, dtype=np.int8),
         "rx_bits_at_edges": np.asarray(rx_data_edges, dtype=np.int8),
+        "rx_pi_code": np.asarray(rx_pi_code, dtype=np.int16),
+        "rx_pd_out": np.asarray(rx_pd_out, dtype=np.int8),
     }
 
 
-def main() -> None:
-    chan_file = ROOT / "data" / "A1_Combined_models_Slice_C_clocks_Slice_D_Data.s10p"
+def _build_default_link(chan_file: Path, rx_pd_out_gain: float) -> UniDirLink:
     link = UniDirLink(
         chan_file=chan_file,
         chan_port_tx_sel=7,
@@ -251,26 +296,48 @@ def main() -> None:
         tx_pi_code=0,
         rx_pi_code=0,
         rx_term_code=63.0,
+        rx_clk_ofst=4.0,
+        rx_slicer_ref=0.5 * Driver.AVDD,
+        rx_pd_out_gain=rx_pd_out_gain,
+        channel_pairs=[(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)],
+        aggressor_ports=None,
+        aggressor_enable=True,
     )
 
-    # Optional RX equalization configuration.
-    # Set >0 to enable CDR PD loop in UniDirLink (RX PI follows rx.pi_code).
-    rx_pd_out_gain = 0.125
-    link.rx.pd_out_gain = float(rx_pd_out_gain)
-
-    link.rx.ctle_en = TRUE
+    link.rx.ctle_en = False
     link.rx.ctle_dc_gain_db = 2
     link.rx.ctle_peaking_gain_db = 3.0
     link.rx.ctle_peaking_freq_hz = 32e9
     link.rx.ctle_zero_freq_hz = np.array([], dtype=np.float64)
     link.rx.ctle_pole_freq_hz = np.array([], dtype=np.float64)
     link.rx.dfe_en = False
+    return link
+
+
+def main() -> None:
+    chan_file = ROOT / "data" / "A1_Combined_models_Slice_C_clocks_Slice_D_Data.s10p"
+    rx_pd_out_gain = 0.125
+
+    # Flag options for eye-diagram comparison.
+    plot_eye_without_aggressors = False
+    plot_eye_with_aggressors = True
+    eye_cycles = 30000
+    aggressor_prbs_amplitude = Driver.AVDD
+    aggressor_seed = 20260304
+
+    # Main waveform run flag.
+    main_trace_with_aggressors = False
+
+    link = _build_default_link(chan_file=chan_file, rx_pd_out_gain=rx_pd_out_gain)
 
     print("TX FFE segment taps:", link.tx.ffe_taps)
     print("TX FFE normalized weights:", link.tx.normalize_weights_from_segments(link.tx.ffe_taps))
     print("RX term code:", link.rx_term_code)
     print("RX pd_out_gain:", link.rx.pd_out_gain)
     print("RX PI mode:", "CDR tracking" if link.rx.pd_out_gain != 0.0 else "fixed rx_pi_code")
+    print("RX slicer ref:", link.rx.ref)
+    print("RX edge clock offset (samples):", link.rx.clk_ofst)
+    print("Aggressor ports (default one TX-side port per aggressor lane):", link.aggressor_ports)
     print("TX driver R(ohm) from FFE:", link.io_term.tx_driver_res_ohm_from_ffe(link.tx.ffe_taps))
     print("RX term R(ohm) from code:", link.io_term.rx_term_res_ohm_from_code(link.rx_term_code))
 
@@ -281,7 +348,9 @@ def main() -> None:
         monitor_keys=[
             "tx_drv_out",
             "tx_to_chan",
+            "rx_xtalk_bump",
             "rx_bump",
+            "rx_xtalk_in",
             "rx_in_pre_ctle",
             "rx_post_ctle",
             "rx_post_aperture",
@@ -289,8 +358,42 @@ def main() -> None:
     )
     print("Pulse monitor keys:", pulse_res["monitor_keys"])
 
-    prbs = run_prbs(link, num_cycles=20000)
-    fig, axs = plt.subplots(3, 1, figsize=(11, 7), sharex=True)
+    prbs = run_prbs(
+        link,
+        num_cycles=20000,
+        with_aggressors=bool(main_trace_with_aggressors),
+        aggressor_amplitude=aggressor_prbs_amplitude,
+        aggressor_seed=aggressor_seed,
+    )
+    if prbs["rx_pi_code"].size > 0:
+        pi_codes = np.asarray(prbs["rx_pi_code"], dtype=np.int16)
+        pi_hist = np.bincount(pi_codes, minlength=128)
+        lock_code = int(np.argmax(pi_hist))
+        # Circular phase-code spread around dominant lock code.
+        pi_delta = ((pi_codes - lock_code + 64) % 128) - 64
+        top_codes = np.argsort(pi_hist)[-5:][::-1]
+        print(
+            "RX CDR PI code stats:",
+            {
+                "lock_code": lock_code,
+                "delta_std": float(np.std(pi_delta)),
+                "delta_pp": float(np.max(pi_delta) - np.min(pi_delta)),
+                "n_unique_codes": int(np.count_nonzero(pi_hist)),
+                "top_codes": [(int(c), int(pi_hist[c])) for c in top_codes if pi_hist[c] > 0],
+            },
+        )
+    if prbs["rx_pd_out"].size > 0:
+        pd = prbs["rx_pd_out"]
+        print(
+            "RX PD output counts:",
+            {
+                "-1": int(np.sum(pd == -1)),
+                "0": int(np.sum(pd == 0)),
+                "+1": int(np.sum(pd == 1)),
+            },
+        )
+
+    fig, axs = plt.subplots(4, 1, figsize=(11, 8), sharex=True)
     axs[0].plot(prbs["rx_in"], linewidth=0.8)
     axs[0].set_title("RX Input (pre-CTLE)")
     axs[0].set_ylabel("Amp")
@@ -303,16 +406,50 @@ def main() -> None:
 
     axs[2].plot(prbs["rx_post_aperture"], linewidth=0.8)
     axs[2].set_title("RX Post-Aperture")
-    axs[2].set_xlabel("Sample")
     axs[2].set_ylabel("Amp")
     axs[2].grid(True, alpha=0.3)
+
+    axs[3].plot(prbs["rx_xtalk_in"], linewidth=0.8)
+    axs[3].set_title("RX Crosstalk Component (post RX termination)")
+    axs[3].set_xlabel("Sample")
+    axs[3].set_ylabel("Amp")
+    axs[3].grid(True, alpha=0.3)
     fig.tight_layout()
 
-    fig_eye, ax_eye = plt.subplots(1, 1, figsize=(8, 4))
-    _, eye_metrics = link.rx.plot_eye(ax=ax_eye, mask_type="diamond", mask_sigma=1.0, return_metrics=True)
-    ax_eye.set_title(f"UniDir RX Eye (x_center={eye_metrics['x_center']:.3f})")
-    fig_eye.tight_layout()
-    print("RX eye metrics:", eye_metrics)
+    eye_cases: list[tuple[str, UniDirLink]] = []
+    if plot_eye_without_aggressors:
+        link_wo = _build_default_link(chan_file=chan_file, rx_pd_out_gain=rx_pd_out_gain)
+        run_prbs(
+            link_wo,
+            num_cycles=eye_cycles,
+            with_aggressors=False,
+            aggressor_amplitude=aggressor_prbs_amplitude,
+            aggressor_seed=aggressor_seed,
+        )
+        eye_cases.append(("Without Aggressors", link_wo))
+    if plot_eye_with_aggressors:
+        link_w = _build_default_link(chan_file=chan_file, rx_pd_out_gain=rx_pd_out_gain)
+        run_prbs(
+            link_w,
+            num_cycles=eye_cycles,
+            with_aggressors=True,
+            aggressor_amplitude=aggressor_prbs_amplitude,
+            aggressor_seed=aggressor_seed,
+        )
+        eye_cases.append(("With Aggressors", link_w))
+
+    if len(eye_cases) > 0:
+        fig_eye, ax_eye = plt.subplots(1, len(eye_cases), figsize=(7.2 * len(eye_cases), 4), squeeze=False)
+        for i, (label, eye_link) in enumerate(eye_cases):
+            _, eye_metrics = eye_link.rx.plot_eye(
+                ax=ax_eye[0, i],
+                mask_type="diamond",
+                mask_sigma=1.0,
+                return_metrics=True,
+            )
+            ax_eye[0, i].set_title(f"{label} (x_center={eye_metrics['x_center']:.3f})")
+            print(f"RX eye metrics ({label}):", eye_metrics)
+        fig_eye.tight_layout()
 
     plt.show()
 
