@@ -1,0 +1,12 @@
+# Dependencies to run v0.2.2/script/test_link_py.py
+# Install with:
+#   pip install -r v0.2.2/requirements_test_link_py.txt
+#
+# Note:
+# - Tkinter is used by the GUI in test_link_py.py and is part of the Python
+#   standard library, but may require OS package installation (e.g. python3-tk).
+
+numpy>=1.24,<3
+scipy>=1.10,<2
+matplotlib>=3.7,<4
+plotly>=5.18,<7
