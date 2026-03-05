@@ -225,11 +225,25 @@ def run_prbs(
     link: UniDirLink,
     num_cycles: int = 20000,
     with_aggressors: bool = False,
+    aggressor_drive_mode: str = "manual_random",
     aggressor_amplitude: float = Driver.AVDD,
+    aggressor_pattern_broadcast: Pattern = Pattern.PRBS31,
+    aggressor_pattern_overrides: dict[int, Pattern] | None = None,
     aggressor_seed: int = 20260304,
 ) -> dict[str, np.ndarray]:
-    link.tx_pattern = Pattern.PRBS31
+    link.tx_pattern = Pattern.PRBS23
     link.set_aggressor_enable(bool(with_aggressors))
+    mode = str(aggressor_drive_mode).strip().lower()
+    if mode not in {"manual_random", "pattern"}:
+        raise ValueError("aggressor_drive_mode must be 'manual_random' or 'pattern'")
+    if mode == "pattern":
+        link.set_aggressor_source_mode("pattern")
+        link.broadcast_aggressor_pattern(aggressor_pattern_broadcast, amplitude=float(aggressor_amplitude))
+        if aggressor_pattern_overrides:
+            for p, pat in aggressor_pattern_overrides.items():
+                link.set_aggressor_pattern(int(p), pat, amplitude=float(aggressor_amplitude))
+    else:
+        link.set_aggressor_source_mode("manual")
 
     rx_in = np.zeros(num_cycles, dtype=np.float64)
     rx_xtalk_bump = np.zeros(num_cycles, dtype=np.float64)
@@ -243,11 +257,11 @@ def run_prbs(
 
     rng = np.random.default_rng(int(aggressor_seed))
     aggr_src = {p: 0.0 for p in link.aggressor_ports}
-    if link.aggressor_ports:
+    if link.aggressor_ports and mode == "manual_random":
         link.set_aggressor_sources(aggr_src)
 
     for i in range(num_cycles):
-        if link.aggressor_ports:
+        if link.aggressor_ports and mode == "manual_random":
             link.set_aggressor_sources(aggr_src)
         link.run()
 
@@ -259,12 +273,12 @@ def run_prbs(
 
         if link.tx_pi.clk_out.is_edge:
             tx_data_edges.append(int(link.tx.data_center))
-            if with_aggressors and link.aggressor_ports:
+            if mode == "manual_random" and with_aggressors and link.aggressor_ports:
                 aggr_src = {
                     p: float(aggressor_amplitude) * float(rng.integers(0, 2))
                     for p in link.aggressor_ports
                 }
-            elif link.aggressor_ports:
+            elif mode == "manual_random" and link.aggressor_ports:
                 aggr_src = {p: 0.0 for p in link.aggressor_ports}
 
         if link.rx_pi.clk_out.is_edge:
@@ -319,14 +333,25 @@ def main() -> None:
     rx_pd_out_gain = 0.125
 
     # Flag options for eye-diagram comparison.
-    plot_eye_without_aggressors = False
+    plot_eye_without_aggressors = True
     plot_eye_with_aggressors = True
     eye_cycles = 30000
+    eye_x_unit = "ui"  # "ui" or time units such as "s", "second", "ns"
+    aggressor_drive_mode = "pattern"  # "manual_random" or "pattern"
     aggressor_prbs_amplitude = Driver.AVDD
+    aggressor_pattern_broadcast = Pattern.PRBS7
+    aggressor_pattern_overrides: dict[int, Pattern] = {
+        1: Pattern.ALL_ONES,
+    }
     aggressor_seed = 20260304
 
     # Main waveform run flag.
     main_trace_with_aggressors = False
+
+    # Specific aggressor -> victim FEXT pulse-response option.
+    plot_specific_fext_pulse = True
+    fext_aggressor_port = 5
+    fext_victim_port = 8
 
     link = _build_default_link(chan_file=chan_file, rx_pd_out_gain=rx_pd_out_gain)
 
@@ -338,10 +363,35 @@ def main() -> None:
     print("RX slicer ref:", link.rx.ref)
     print("RX edge clock offset (samples):", link.rx.clk_ofst)
     print("Aggressor ports (default one TX-side port per aggressor lane):", link.aggressor_ports)
+    print("Eye x-axis unit:", eye_x_unit)
+    print(
+        "Aggressor data config:",
+        {
+            "drive_mode": aggressor_drive_mode,
+            "broadcast_pattern": aggressor_pattern_broadcast.name,
+            "pattern_overrides": {int(k): v.name for k, v in aggressor_pattern_overrides.items()},
+            "amplitude": float(aggressor_prbs_amplitude),
+        },
+    )
     print("TX driver R(ohm) from FFE:", link.io_term.tx_driver_res_ohm_from_ffe(link.tx.ffe_taps))
     print("RX term R(ohm) from code:", link.io_term.rx_term_res_ohm_from_code(link.rx_term_code))
 
     link.plot_path_impulses(time_unit="ns")
+    if plot_specific_fext_pulse:
+        fext_data = link.plot_aggressor_to_victim_port_pulse_response(
+            aggressor_port=fext_aggressor_port,
+            victim_port=fext_victim_port,
+            require_coupling="FEXT",
+            time_unit="ns",
+        )
+        print(
+            "Specific aggressor pulse:",
+            {
+                "aggressor_port": fext_data["aggressor_port"],
+                "victim_port": fext_data["victim_port"],
+                "coupling_type": fext_data["coupling_type"],
+            },
+        )
 
     pulse_res = run_1ui_pulse_response(
         link,
@@ -362,7 +412,10 @@ def main() -> None:
         link,
         num_cycles=20000,
         with_aggressors=bool(main_trace_with_aggressors),
+        aggressor_drive_mode=aggressor_drive_mode,
         aggressor_amplitude=aggressor_prbs_amplitude,
+        aggressor_pattern_broadcast=aggressor_pattern_broadcast,
+        aggressor_pattern_overrides=aggressor_pattern_overrides,
         aggressor_seed=aggressor_seed,
     )
     if prbs["rx_pi_code"].size > 0:
@@ -423,7 +476,10 @@ def main() -> None:
             link_wo,
             num_cycles=eye_cycles,
             with_aggressors=False,
+            aggressor_drive_mode=aggressor_drive_mode,
             aggressor_amplitude=aggressor_prbs_amplitude,
+            aggressor_pattern_broadcast=aggressor_pattern_broadcast,
+            aggressor_pattern_overrides=aggressor_pattern_overrides,
             aggressor_seed=aggressor_seed,
         )
         eye_cases.append(("Without Aggressors", link_wo))
@@ -433,7 +489,10 @@ def main() -> None:
             link_w,
             num_cycles=eye_cycles,
             with_aggressors=True,
+            aggressor_drive_mode=aggressor_drive_mode,
             aggressor_amplitude=aggressor_prbs_amplitude,
+            aggressor_pattern_broadcast=aggressor_pattern_broadcast,
+            aggressor_pattern_overrides=aggressor_pattern_overrides,
             aggressor_seed=aggressor_seed,
         )
         eye_cases.append(("With Aggressors", link_w))
@@ -445,9 +504,11 @@ def main() -> None:
                 ax=ax_eye[0, i],
                 mask_type="diamond",
                 mask_sigma=1.0,
+                x_unit=eye_x_unit,
                 return_metrics=True,
             )
-            ax_eye[0, i].set_title(f"{label} (x_center={eye_metrics['x_center']:.3f})")
+            xc = float(eye_metrics.get("x_center_in_unit", eye_metrics.get("x_center", float("nan"))))
+            ax_eye[0, i].set_title(f"{label} (x_center={xc:.3f} {eye_x_unit})")
             print(f"RX eye metrics ({label}):", eye_metrics)
         fig_eye.tight_layout()
 

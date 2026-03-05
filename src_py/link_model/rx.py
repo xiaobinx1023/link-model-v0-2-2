@@ -34,6 +34,7 @@ class Rx:
         self.slicer_sensitivity = 0.0
         self.slicer_aperture_ui = 0.0
         self.samples_per_ui = 16
+        self.eye_trace_span_ui = 2.0
         self.sample_rate_hz = 256e9
 
         self.data = 0
@@ -86,8 +87,18 @@ class Rx:
         ap_samps = int(round(ap_ui * float(self.samples_per_ui)))
         self._aperture.aperture_samples = max(1, ap_samps)
 
+        self._eye_monitor.configure_timing(
+            num_samples_per_trace=int(max(1, self.samples_per_ui)),
+            sample_rate_hz=float(self.sample_rate_hz),
+            trace_span_ui=float(self.eye_trace_span_ui),
+        )
+
     def run(self) -> None:
         self._configure_blocks()
+
+        # Keep PI accumulator aligned to externally forced code when CDR is disabled.
+        if float(self.pd_out_gain) == 0.0:
+            self._pi_code_acc = float(int(self.pi_code) % 128)
 
         self._clk_data = self.clk.copy()
         self._clk_delayline.delay = self.clk_ofst
@@ -119,8 +130,8 @@ class Rx:
             else:
                 self._pd_out = 0
 
-            self._pi_code_acc = (self._pi_code_acc - self.pd_out_gain * self._pd_out) % 128
-            self.pi_code = int(math.floor(self._pi_code_acc))
+            self._pi_code_acc = float((self._pi_code_acc - self.pd_out_gain * self._pd_out) % 128.0)
+            self.pi_code = int(math.floor(self._pi_code_acc)) % 128
             self._dfe.update(self.data)
 
         self._din_prev = float(self.din_apertured)

@@ -15,7 +15,7 @@ class TxTerminationConfig:
     # Minimum non-zero segment count used for divide protection.
     tap_code_floor: float = 1.0
 
-    tx_cap_f: float = 50e-15
+    tx_cap_f: float = 75e-15
     tx_ind_h: float = 0.0
 
 

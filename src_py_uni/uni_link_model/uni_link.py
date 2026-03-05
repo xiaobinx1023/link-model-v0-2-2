@@ -11,7 +11,7 @@ from scipy import interpolate
 
 from src_py.link_model.channel import Channel
 from src_py.link_model.clock_gen import ClockGen
-from src_py.link_model.data_gen import Pattern
+from src_py.link_model.data_gen import DataGen, Pattern
 from src_py.link_model.driver import Driver
 from src_py.link_model.fir import FIR
 from src_py.link_model.pi import PI
@@ -96,6 +96,7 @@ class UniDirLink:
         self.tf_tx_drv_to_rx = np.array([], dtype=np.complex128)
         self.tf_xtalk_to_rx_bump_total = np.array([], dtype=np.complex128)
         self.tf_xtalk_to_rx_bump_by_port: dict[int, npt.NDArray[np.complex128]] = {}
+        self.tf_xtalk_to_victim_port_by_pair: dict[tuple[int, int], npt.NDArray[np.complex128]] = {}
 
         self.imp_tx_drv_to_chan = np.zeros(Channel.FILTER_LEN, dtype=np.float64)
         self.imp_chan_tx_to_rx = np.zeros(Channel.FILTER_LEN, dtype=np.float64)
@@ -103,6 +104,7 @@ class UniDirLink:
         self.imp_tx_drv_to_rx = np.zeros(Channel.FILTER_LEN, dtype=np.float64)
         self.imp_xtalk_to_rx_bump_total = np.zeros(Channel.FILTER_LEN, dtype=np.float64)
         self.imp_xtalk_to_rx_bump_by_port: dict[int, npt.NDArray[np.float64]] = {}
+        self.imp_xtalk_to_victim_port_by_pair: dict[tuple[int, int], npt.NDArray[np.float64]] = {}
 
         self.tx_drv_out = 0.0
         self.tx_to_chan = 0.0
@@ -135,8 +137,12 @@ class UniDirLink:
         self._port_is_tx_side = self._build_port_tx_side_map()
 
         self.aggressor_enable = bool(aggressor_enable)
+        self.aggressor_source_mode = "manual"  # "manual" or "pattern"
         self.aggressor_ports: list[int] = []
         self.aggressor_port_src: dict[int, float] = {}
+        self.aggressor_pattern_by_port: dict[int, Pattern] = {}
+        self.aggressor_amplitude_by_port: dict[int, float] = {}
+        self._aggressor_data_gen: dict[int, DataGen] = {}
         self.set_aggressor_ports(aggressor_ports)
 
     @staticmethod
@@ -258,10 +264,38 @@ class UniDirLink:
             cleaned.append(p)
         return cleaned
 
+    @staticmethod
+    def _normalize_pattern(pattern: Pattern | int | str) -> Pattern:
+        if isinstance(pattern, Pattern):
+            return Pattern(pattern)
+        if isinstance(pattern, str):
+            key = pattern.strip().upper()
+            if key in Pattern.__members__:
+                return Pattern.__members__[key]
+        try:
+            return Pattern(int(pattern))
+        except Exception as exc:
+            raise ValueError(
+                f"Unsupported aggressor pattern '{pattern}'. Use Pattern enum/name/value."
+            ) from exc
+
     def set_aggressor_ports(self, aggressor_ports: list[int] | None) -> None:
-        prev = getattr(self, "aggressor_port_src", {})
+        prev_src = dict(getattr(self, "aggressor_port_src", {}))
+        prev_pat = dict(getattr(self, "aggressor_pattern_by_port", {}))
+        prev_amp = dict(getattr(self, "aggressor_amplitude_by_port", {}))
         self.aggressor_ports = self._normalize_aggressor_ports(aggressor_ports)
-        self.aggressor_port_src = {p: float(prev.get(p, 0.0)) for p in self.aggressor_ports}
+        self.aggressor_port_src = {p: float(prev_src.get(p, 0.0)) for p in self.aggressor_ports}
+        self.aggressor_pattern_by_port = {
+            p: Pattern(prev_pat.get(p, Pattern.PRBS31)) for p in self.aggressor_ports
+        }
+        self.aggressor_amplitude_by_port = {
+            p: float(prev_amp.get(p, Driver.AVDD)) for p in self.aggressor_ports
+        }
+        self._aggressor_data_gen = {}
+        for p in self.aggressor_ports:
+            dg = DataGen(pattern=self.aggressor_pattern_by_port[p])
+            self._aggressor_data_gen[p] = dg
+            self.aggressor_port_src[p] = float(prev_src.get(p, 0.0))
         self.update_impulses()
 
     def set_aggressor_sources(self, sources: dict[int, float]) -> None:
@@ -273,6 +307,62 @@ class UniDirLink:
 
     def set_aggressor_enable(self, enabled: bool) -> None:
         self.aggressor_enable = bool(enabled)
+
+    def set_aggressor_source_mode(self, mode: str) -> None:
+        mode_l = str(mode).strip().lower()
+        if mode_l not in {"manual", "pattern"}:
+            raise ValueError("aggressor source mode must be 'manual' or 'pattern'")
+        self.aggressor_source_mode = mode_l
+
+    def set_aggressor_pattern(
+        self,
+        aggressor_port: int,
+        pattern: Pattern | int | str,
+        amplitude: float | None = None,
+    ) -> None:
+        port = int(aggressor_port)
+        if port not in self.aggressor_pattern_by_port:
+            raise ValueError(f"Aggressor port {port} is not enabled. Enabled ports: {self.aggressor_ports}")
+        pat = self._normalize_pattern(pattern)
+        self.aggressor_pattern_by_port[port] = pat
+        self._aggressor_data_gen[port].pattern = pat
+        if amplitude is not None:
+            self.aggressor_amplitude_by_port[port] = float(amplitude)
+
+    def set_aggressor_patterns(
+        self,
+        patterns: dict[int, Pattern | int | str],
+        amplitude: float | None = None,
+    ) -> None:
+        for p, pat in patterns.items():
+            self.set_aggressor_pattern(int(p), pat, amplitude=amplitude)
+
+    def broadcast_aggressor_pattern(
+        self,
+        pattern: Pattern | int | str,
+        amplitude: float | None = None,
+    ) -> None:
+        pat = self._normalize_pattern(pattern)
+        for p in self.aggressor_ports:
+            self.set_aggressor_pattern(p, pat, amplitude=amplitude)
+
+    def broadcast_aggressor_amplitude(self, amplitude: float) -> None:
+        amp = float(amplitude)
+        for p in self.aggressor_ports:
+            self.aggressor_amplitude_by_port[p] = amp
+
+    def _update_aggressor_sources_from_patterns(self) -> None:
+        if not self.aggressor_enable or self.aggressor_source_mode != "pattern":
+            return
+        for p in self.aggressor_ports:
+            dg = self._aggressor_data_gen.get(p)
+            if dg is None:
+                continue
+            dg.clk = self.tx_pi.clk_out
+            dg.run()
+            bit = int(dg.out)
+            amp = float(self.aggressor_amplitude_by_port.get(p, Driver.AVDD))
+            self.aggressor_port_src[p] = amp * float(bit)
 
     def load_chan_data(self) -> ChanData:
         snp_freq, snp_data, _, _, _ = Tools.parse_snp_file(self.chan_file)
@@ -356,6 +446,11 @@ class UniDirLink:
             out[p - 1] = z_tx_i if self._port_is_tx_side.get(p, True) else z_rx_i
         return out
 
+    def _classify_xtalk(self, aggressor_port: int, victim_port: int) -> str:
+        aggr_side = bool(self._port_is_tx_side.get(int(aggressor_port), True))
+        vic_side = bool(self._port_is_tx_side.get(int(victim_port), True))
+        return "FEXT" if aggr_side != vic_side else "NEXT"
+
     def update_impulses(self) -> None:
         freq = self.chan_data.freq
         self.tf_freq = freq
@@ -397,33 +492,46 @@ class UniDirLink:
 
         self.tf_xtalk_to_rx_bump_total = np.zeros(n_freq, dtype=np.complex128)
         self.tf_xtalk_to_rx_bump_by_port = {}
+        self.tf_xtalk_to_victim_port_by_pair = {}
         self.imp_xtalk_to_rx_bump_by_port = {}
+        self.imp_xtalk_to_victim_port_by_pair = {}
         self._xtalk_filters = {}
         delay_s = self.IMP_DELAY_PS / 1e12
         for port in self.aggressor_ports:
             src_idx = int(port) - 1
-            tf_port = np.zeros(n_freq, dtype=np.complex128)
+            tf_port_to_rx = np.zeros(n_freq, dtype=np.complex128)
+            tf_port_to_vtx = np.zeros(n_freq, dtype=np.complex128)
             for i in range(n_freq):
                 s_full_i = self.chan_data.S_full[:, :, i]
                 v, gamma_in_src = self._solve_loaded_network(s_full_i, gamma_load_by_freq[i, :], src_idx)
                 v_src = complex(v[src_idx])
                 if abs(v_src) < 1e-18:
-                    tf_port[i] = 0.0 + 0.0j
+                    tf_port_to_rx[i] = 0.0 + 0.0j
+                    tf_port_to_vtx[i] = 0.0 + 0.0j
                     continue
 
                 tf_src_port_to_vrx = complex(v[rx_idx] / v_src)
+                tf_src_port_to_vtx = complex(v[tx_idx] / v_src)
                 den = (1.0 - gamma_in_src)
                 z_in_src = complex(1e18) if abs(den) < 1e-18 else complex(self.Z0 * (1.0 + gamma_in_src) / den)
                 z_seen_src = self._par(complex(term_state.z_tx_io[i]), z_in_src)
                 tf_src_drv_to_port = complex(z_seen_src / (term_state.r_tx_drv_ohm + z_seen_src))
-                tf_port[i] = tf_src_drv_to_port * tf_src_port_to_vrx
+                tf_port_to_rx[i] = tf_src_drv_to_port * tf_src_port_to_vrx
+                tf_port_to_vtx[i] = tf_src_drv_to_port * tf_src_port_to_vtx
 
-            self.tf_xtalk_to_rx_bump_by_port[port] = tf_port
-            self.tf_xtalk_to_rx_bump_total += tf_port
-            _, imp_port = Tools.convert_tf_to_imp(freq, tf_port, self.SAMP_FREQ_HZ, delay_s)
-            imp_port = imp_port[: Channel.FILTER_LEN]
-            self.imp_xtalk_to_rx_bump_by_port[port] = imp_port
-            self._xtalk_filters[port] = FIR(imp_port)
+            self.tf_xtalk_to_rx_bump_by_port[port] = tf_port_to_rx
+            self.tf_xtalk_to_victim_port_by_pair[(port, int(self.chan_port_rx_sel))] = tf_port_to_rx
+            self.tf_xtalk_to_victim_port_by_pair[(port, int(self.chan_port_tx_sel))] = tf_port_to_vtx
+            self.tf_xtalk_to_rx_bump_total += tf_port_to_rx
+
+            _, imp_port_rx = Tools.convert_tf_to_imp(freq, tf_port_to_rx, self.SAMP_FREQ_HZ, delay_s)
+            _, imp_port_vtx = Tools.convert_tf_to_imp(freq, tf_port_to_vtx, self.SAMP_FREQ_HZ, delay_s)
+            imp_port_rx = imp_port_rx[: Channel.FILTER_LEN]
+            imp_port_vtx = imp_port_vtx[: Channel.FILTER_LEN]
+            self.imp_xtalk_to_rx_bump_by_port[port] = imp_port_rx
+            self.imp_xtalk_to_victim_port_by_pair[(port, int(self.chan_port_rx_sel))] = imp_port_rx
+            self.imp_xtalk_to_victim_port_by_pair[(port, int(self.chan_port_tx_sel))] = imp_port_vtx
+            self._xtalk_filters[port] = FIR(imp_port_rx)
 
         _, self.imp_tx_drv_to_chan = Tools.convert_tf_to_imp(freq, self.tf_tx_drv_to_chan, self.SAMP_FREQ_HZ, delay_s)
         _, self.imp_chan_tx_to_rx = Tools.convert_tf_to_imp(freq, self.tf_chan_tx_to_rx, self.SAMP_FREQ_HZ)
@@ -475,6 +583,7 @@ class UniDirLink:
         self.tx.clk = self.tx_pi.clk_out
         self.tx.data_gen_pattern = Pattern(self.tx_pattern)
         self.tx.run()
+        self._update_aggressor_sources_from_patterns()
 
         self.tx_drv_out = float(self.tx.out)
         self.tx_to_chan = float(self._filt_tx_drv_to_chan.run(self.tx_drv_out))
@@ -511,6 +620,69 @@ class UniDirLink:
         if include_total:
             out["xtalk_to_victim_rx_bump_total_impulse"] = self.imp_xtalk_to_rx_bump_total.copy()
         return out
+
+    def get_aggressor_to_victim_port_pulse_response(
+        self,
+        aggressor_port: int,
+        victim_port: int,
+    ) -> dict[str, Any]:
+        aggr = int(aggressor_port)
+        vic = int(victim_port)
+        victim_ports = {int(self.chan_port_tx_sel), int(self.chan_port_rx_sel)}
+        if vic not in victim_ports:
+            raise ValueError(
+                f"Victim port {vic} must be one of victim lane ports {sorted(victim_ports)}."
+            )
+        key = (aggr, vic)
+        if key not in self.imp_xtalk_to_victim_port_by_pair:
+            raise ValueError(
+                f"Aggressor port {aggr} is unavailable. Enabled aggressor ports: {self.aggressor_ports}"
+            )
+        t = np.arange(Channel.FILTER_LEN, dtype=np.float64) / self.SAMP_FREQ_HZ
+        coupling = self._classify_xtalk(aggr, vic)
+        return {
+            "time_sec": t,
+            "aggressor_port": aggr,
+            "victim_port": vic,
+            "coupling_type": coupling,
+            "impulse": self.imp_xtalk_to_victim_port_by_pair[key].copy(),
+        }
+
+    def plot_aggressor_to_victim_port_pulse_response(
+        self,
+        aggressor_port: int,
+        victim_port: int,
+        require_coupling: str | None = None,
+        time_unit: str = "ns",
+    ) -> dict[str, Any]:
+        data = self.get_aggressor_to_victim_port_pulse_response(
+            aggressor_port=aggressor_port,
+            victim_port=victim_port,
+        )
+        coupling = str(data["coupling_type"]).upper()
+        if require_coupling is not None and coupling != str(require_coupling).upper():
+            raise ValueError(
+                f"Requested coupling '{require_coupling}' does not match actual '{coupling}' "
+                f"for aggressor port {aggressor_port} -> victim port {victim_port}."
+            )
+
+        unit_scale = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9, "ps": 1e12}
+        if time_unit not in unit_scale:
+            raise ValueError(f"Unsupported time_unit '{time_unit}'. Use one of {list(unit_scale.keys())}.")
+        scale = unit_scale[time_unit]
+        t = np.asarray(data["time_sec"], dtype=np.float64) * scale
+        y = np.asarray(data["impulse"], dtype=np.float64)
+
+        fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+        ax.plot(t, y, linewidth=1.5)
+        ax.set_title(
+            f"{coupling} 1-UI Pulse Response: Port {int(aggressor_port)} -> Victim Port {int(victim_port)}"
+        )
+        ax.set_xlabel(f"Time ({time_unit})")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return data
 
     def plot_path_impulses(self, time_unit: str = "ns") -> None:
         unit_scale = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9, "ps": 1e12}
