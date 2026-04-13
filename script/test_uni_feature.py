@@ -22,6 +22,15 @@ EYE_X_UNIT = "ui"  # "ui" or time units such as "s", "second", "ns"
 MonitorGetter = Callable[[UniDirLink], float]
 
 
+def _get_data_ui_samples(link: UniDirLink) -> int:
+    if hasattr(link, "data_ui_samples"):
+        return int(getattr(link, "data_ui_samples"))
+    data_rate_hz = float(getattr(link, "data_rate_hz", float(link.CLK_FREQ_HZ)))
+    if data_rate_hz <= 0.0:
+        return 1
+    return max(1, int(round(float(link.SAMP_FREQ_HZ) / data_rate_hz)))
+
+
 @dataclass
 class PulseMetric:
     peak_abs: float
@@ -86,10 +95,13 @@ def _build_link(
         cg._period_jitter = 0.0
         cg._period = cg.nominal_period
         cg._timer = 0.0
-        cg._clk_q_pos_edge_timer_val = cg._period / 4.0
-        cg._clk_i_neg_edge_timer_val = cg._period / 2.0
-        cg._clk_q_neg_edge_timer_val = cg._period * 3.0 / 4.0
-        cg._clk_i_pos_edge_timer_val = cg._period
+        if hasattr(cg, "_reset_cycle_timers"):
+            cg._reset_cycle_timers(carry_frac=0.0)
+        else:
+            cg._clk_q_pos_edge_timer_val = cg._period / 4.0
+            cg._clk_i_neg_edge_timer_val = cg._period / 2.0
+            cg._clk_q_neg_edge_timer_val = cg._period * 3.0 / 4.0
+            cg._clk_i_pos_edge_timer_val = cg._period
 
     return link
 
@@ -172,7 +184,7 @@ def _run_main_1ui_pulse(
     tail: int = 256,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     getters = _monitor_getters()
-    ui_samples = int(round(link.SAMP_FREQ_HZ / link.CLK_FREQ_HZ))
+    ui_samples = _get_data_ui_samples(link)
     pulse_len = ui_samples
     total = warmup + pulse_len + tail
     pulse_start = warmup
@@ -221,7 +233,7 @@ def _run_aggressor_1ui_pulse_to_rx(
     tail: int = 256,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], float]:
     getters = _monitor_getters()
-    ui_samples = int(round(link.SAMP_FREQ_HZ / link.CLK_FREQ_HZ))
+    ui_samples = _get_data_ui_samples(link)
     pulse_len = ui_samples
     total = warmup + pulse_len + tail
     pulse_start = warmup
@@ -307,7 +319,8 @@ def _sanity_check_aggressor_pulse(
     idx_model = int(np.argmax(np.abs(y_model)))
     t_model_peak = float(t_model_ns[idx_model])
     t_meas_peak_rel = float(summary["rx_xtalk_bump"].peak_time_ns) - float(pulse_start_ns)
-    ui_ns = 1e9 / float(link.CLK_FREQ_HZ)
+    data_rate_hz = float(getattr(link, "data_rate_hz", float(link.CLK_FREQ_HZ)))
+    ui_ns = 1e9 / data_rate_hz
     if abs(t_model_peak - t_meas_peak_rel) > 1.5 * ui_ns:
         errors.append(
             "Aggressor bump delay mismatch versus model: "
@@ -426,7 +439,7 @@ def test_3_cdr_loop_pi_tracking() -> None:
     pd_out: list[int] = []
     for _ in range(n):
         link.run()
-        if link.rx_pi.clk_out.is_edge:
+        if link.rx.clk.is_edge:
             pi_code.append(int(link.rx.pi_code))
             pd_out.append(int(link.rx._pd_out))
     pi = np.asarray(pi_code, dtype=np.int16)

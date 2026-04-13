@@ -15,7 +15,6 @@ from .clock_delay import ClockDelay
 from .clock_gen import ClockGen
 from .controller import Controller
 from .fir import FIR
-from .io_termination import IOTerminationModel
 from .pi import PI
 from .rx import Rx
 from .tools import Tools
@@ -75,7 +74,6 @@ class Link:
         self.chan_file = str(chan_file)
         self.chan_port_one_sel = int(chan_port_one_sel)
         self.chan_port_two_sel = int(chan_port_two_sel)
-        self.io_termination = IOTerminationModel(z0_ohm=self.Z0)
         self.chan_data = self.load_chan_data()
         self.channel_pairs = self._normalize_channel_pairs(channel_pairs)
         self.victim_pair = self._find_pair_for_ports(self.chan_port_one_sel, self.chan_port_two_sel)
@@ -128,6 +126,12 @@ class Link:
 
         self.update_chan_afe_impulses()
         self.update_tx_drv_weights()
+
+    @staticmethod
+    def _par(z1: npt.ArrayLike, z2: npt.ArrayLike):
+        z1a = np.asarray(z1)
+        z2a = np.asarray(z2)
+        return 1.0 / (1.0 / z1a + 1.0 / z2a)
 
     @staticmethod
     def _interp_complex(x_old, y_old, x_new):
@@ -413,23 +417,40 @@ class Link:
         self._dominant_aggressors.sort(key=lambda x: x[1], reverse=True)
 
     def update_chan_afe_impulses(self) -> None:
+        r_sens = 160.0
+        r_main_drv_mas = 2700.0 / np.sum(self.master_ctrl.tx_main_drv_codes)
+        r_echo_drv_mas = 5400.0 / np.sum(self.master_ctrl.tx_echo_drv_codes) + 230.0
+        r_main_drv_slv = 2700.0 / np.sum(self.slave_ctrl.tx_main_drv_codes)
+        r_echo_drv_slv = 5400.0 / np.sum(self.slave_ctrl.tx_echo_drv_codes) + 230.0
+
+        c_tx_mas = 50e-15
+        c_rx_mas = 35e-15
+        c_tx_slv = 50e-15
+        c_rx_slv = 35e-15
+
         freq = self.chan_data.freq
         self.tf_freq = freq
 
-        mas_state = self.io_termination.build_side_state(
-            freq_hz=freq,
-            main_drv_codes=self.master_ctrl.tx_main_drv_codes,
-            echo_drv_codes=self.master_ctrl.tx_echo_drv_codes,
-            side="master",
+        def cap_impedance(cap: float) -> npt.NDArray[np.complex128]:
+            z = np.empty(freq.size, dtype=np.complex128)
+            z[0] = 1e30
+            if freq.size > 1:
+                z[1:] = 1.0 / (1j * 2 * np.pi * freq[1:] * cap)
+            return z
+
+        z_c_tx_mas = cap_impedance(c_tx_mas)
+        z_c_rx_mas = cap_impedance(c_rx_mas)
+        z_c_tx_slv = cap_impedance(c_tx_slv)
+        z_c_rx_slv = cap_impedance(c_rx_slv)
+
+        z_load_mas = self._par(
+            self._par(self._par(r_echo_drv_mas, z_c_rx_mas) + r_sens, r_main_drv_mas),
+            z_c_tx_mas,
         )
-        slv_state = self.io_termination.build_side_state(
-            freq_hz=freq,
-            main_drv_codes=self.slave_ctrl.tx_main_drv_codes,
-            echo_drv_codes=self.slave_ctrl.tx_echo_drv_codes,
-            side="slave",
+        z_load_slv = self._par(
+            self._par(self._par(r_echo_drv_slv, z_c_rx_slv) + r_sens, r_main_drv_slv),
+            z_c_tx_slv,
         )
-        z_load_mas = mas_state.z_load
-        z_load_slv = slv_state.z_load
 
         gamma_load_mas = (z_load_mas - self.Z0) / (z_load_mas + self.Z0)
         gamma_load_slv = (z_load_slv - self.Z0) / (z_load_slv + self.Z0)
@@ -457,27 +478,59 @@ class Link:
             s12 / (1 - gamma_load_mas * s11) * (1 + gamma_load_mas) / (1 + gamma_in_chan_from_slv)
         )
 
-        mas_tf = self.io_termination.compute_side_transfer(
-            side="master",
-            side_state=mas_state,
-            z_in_chan=z_in_chan_from_mas,
+        self.tf_chan_to_rx_mas = self._par(z_c_rx_mas, r_echo_drv_mas) / (
+            r_sens + self._par(z_c_rx_mas, r_echo_drv_mas)
         )
-        self.tf_chan_to_rx_mas = mas_tf["tf_chan_to_rx"]
-        self.tf_main_drv_to_chan_mas = mas_tf["tf_main_drv_to_chan"]
-        self.tf_main_drv_to_rx_mas = mas_tf["tf_main_drv_to_rx"]
-        self.tf_echo_drv_to_rx_mas = mas_tf["tf_echo_drv_to_rx"]
-        self.tf_echo_drv_to_chan_mas = mas_tf["tf_echo_drv_to_chan"]
+        self.tf_main_drv_to_chan_mas = self._par(
+            r_main_drv_mas,
+            self._par(
+                (r_sens + self._par(z_c_rx_mas, r_echo_drv_mas)),
+                self._par(z_c_tx_mas, z_in_chan_from_mas),
+            ),
+        ) / r_main_drv_mas
+        self.tf_main_drv_to_rx_mas = self.tf_main_drv_to_chan_mas * self._par(z_c_rx_mas, r_echo_drv_mas) / (
+            self._par(z_c_rx_mas, r_echo_drv_mas) + r_sens
+        )
+        self.tf_echo_drv_to_rx_mas = self._par(
+            r_echo_drv_mas,
+            self._par(
+                z_c_rx_mas,
+                r_sens + self._par(r_main_drv_mas, self._par(z_c_tx_mas, z_in_chan_from_mas)),
+            ),
+        ) / r_echo_drv_mas
+        self.tf_echo_drv_to_chan_mas = self.tf_echo_drv_to_rx_mas * self._par(
+            r_main_drv_mas,
+            self._par(z_c_tx_mas, z_in_chan_from_mas),
+        ) / (
+            self._par(r_main_drv_mas, self._par(z_c_tx_mas, z_in_chan_from_mas)) + r_sens
+        )
 
-        slv_tf = self.io_termination.compute_side_transfer(
-            side="slave",
-            side_state=slv_state,
-            z_in_chan=z_in_chan_from_slv,
+        self.tf_chan_to_rx_slv = self._par(z_c_rx_slv, r_echo_drv_slv) / (
+            r_sens + self._par(z_c_rx_slv, r_echo_drv_slv)
         )
-        self.tf_chan_to_rx_slv = slv_tf["tf_chan_to_rx"]
-        self.tf_main_drv_to_chan_slv = slv_tf["tf_main_drv_to_chan"]
-        self.tf_main_drv_to_rx_slv = slv_tf["tf_main_drv_to_rx"]
-        self.tf_echo_drv_to_rx_slv = slv_tf["tf_echo_drv_to_rx"]
-        self.tf_echo_drv_to_chan_slv = slv_tf["tf_echo_drv_to_chan"]
+        self.tf_main_drv_to_chan_slv = self._par(
+            r_main_drv_slv,
+            self._par(
+                (r_sens + self._par(z_c_rx_slv, r_echo_drv_slv)),
+                self._par(z_c_tx_slv, z_in_chan_from_slv),
+            ),
+        ) / r_main_drv_slv
+        self.tf_main_drv_to_rx_slv = self.tf_main_drv_to_chan_slv * self._par(z_c_rx_slv, r_echo_drv_slv) / (
+            self._par(z_c_rx_slv, r_echo_drv_slv) + r_sens
+        )
+        self.tf_echo_drv_to_rx_slv = self._par(
+            r_echo_drv_slv,
+            self._par(
+                z_c_rx_slv,
+                r_sens + self._par(r_main_drv_slv, self._par(z_c_tx_slv, z_in_chan_from_slv)),
+            ),
+        ) / r_echo_drv_slv
+        self.tf_echo_drv_to_chan_slv = self.tf_echo_drv_to_rx_slv * self._par(
+            r_main_drv_slv,
+            self._par(z_c_tx_slv, z_in_chan_from_slv),
+        ) / (
+            self._par(r_main_drv_slv, self._par(z_c_tx_slv, z_in_chan_from_slv)) + r_sens
+        )
 
         # Crosstalk from selected aggressor ports to victim ports, with proper termination at all ports.
         self._update_xtalk_impulses(z_load_mas=z_load_mas, z_load_slv=z_load_slv)
@@ -774,18 +827,14 @@ class Link:
             axes[0],
             mask_type="diamond",
             mask_sigma=1,
-            x_unit="ui",
             return_metrics=True)
-        master_xc = float(master_eye_metrics.get("x_center_in_unit", master_eye_metrics.get("x_center", float("nan"))))
-        axes[0].set_title(f"Master Eye (x_center={master_xc:.3f} UI)")
+        axes[0].set_title(f"Master Eye (x_center={master_eye_metrics['x_center']:.3f})")
         _, slave_eye_metrics = self.slave_rx.plot_eye(
             axes[1],
             mask_type="diamond",
             mask_sigma=1,
-            x_unit="ui",
             return_metrics=True)
-        slave_xc = float(slave_eye_metrics.get("x_center_in_unit", slave_eye_metrics.get("x_center", float("nan"))))
-        axes[1].set_title(f"Slave Eye (x_center={slave_xc:.3f} UI)")
+        axes[1].set_title(f"Slave Eye (x_center={slave_eye_metrics['x_center']:.3f})")
         fig.tight_layout()
         if show:
             plt.pause(0.001)

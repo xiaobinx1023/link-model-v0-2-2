@@ -7,7 +7,6 @@ import matplotlib.patches as mpatches
 import numpy as np
 import numpy.typing as npt
 from matplotlib.axes import Axes
-from scipy.stats import norm
 
 from .circular_buffer import CircularBuffer
 from .clock import Clock
@@ -20,9 +19,6 @@ class EyeMonitor:
 
         self._num_traces = int(num_traces)
         self._num_samples_per_trace = int(num_samples_per_trace)
-        # One eye trace spans 2 UI by default in this model.
-        self._trace_span_ui = 2.0
-        self._sample_rate_hz = 1.0
         self._delay_buffer: CircularBuffer[float] = CircularBuffer(self._num_traces)
         self._trace_buffer: CircularBuffer[List[float]] = CircularBuffer(self._num_traces)
 
@@ -44,83 +40,18 @@ class EyeMonitor:
                 del self._new_traces[i]
                 del self._new_delays[i]
 
-    def clear(self) -> None:
-        """Clear captured and in-flight eye traces."""
-        self._delay_buffer = CircularBuffer(self._num_traces)
-        self._trace_buffer = CircularBuffer(self._num_traces)
-        self._new_delays = []
-        self._new_traces = []
-
-    def configure_timing(
-        self,
-        num_samples_per_trace: int,
-        sample_rate_hz: float | None = None,
-        trace_span_ui: float | None = None,
-    ) -> None:
-        n_samp = max(1, int(num_samples_per_trace))
-        if n_samp != self._num_samples_per_trace:
-            self._num_samples_per_trace = n_samp
-            self._delay_buffer = CircularBuffer(self._num_traces)
-            self._trace_buffer = CircularBuffer(self._num_traces)
-            self._new_delays = []
-            self._new_traces = []
-        if sample_rate_hz is not None and float(sample_rate_hz) > 0:
-            self._sample_rate_hz = float(sample_rate_hz)
-        if trace_span_ui is not None and float(trace_span_ui) > 0:
-            self._trace_span_ui = float(trace_span_ui)
-
     def _build_interpolated_traces(
         self, interp_step: float
     ) -> tuple[npt.NDArray[np.float64], list[npt.NDArray[np.float64]]]:
         traces = self._trace_buffer.get_data()
         delays = self._delay_buffer.get_data()
-        # Use one trace-span exactly (avoid plotting beyond configured UI span).
-        x_grid = np.arange(0.0, float(self._num_samples_per_trace) + float(interp_step), float(interp_step))
+        x_grid = np.arange(0.0, self._num_samples_per_trace + 1.0, float(interp_step))
         interp_traces: list[npt.NDArray[np.float64]] = []
         for trace, delay in zip(traces, delays):
             indices = np.arange(len(trace), dtype=np.float64) + float(delay)
             y = np.interp(x_grid, indices, np.asarray(trace, dtype=np.float64))
             interp_traces.append(y)
         return x_grid, interp_traces
-
-    def _x_axis_transform(
-        self,
-        x_grid_sample: npt.NDArray[np.float64],
-        x_unit: str,
-    ) -> tuple[npt.NDArray[np.float64], float, str]:
-        unit = str(x_unit).strip().lower()
-        if unit in {"sample", "samples", "sample_index"}:
-            return np.asarray(x_grid_sample, dtype=np.float64), 1.0, "Sample Index"
-        if unit == "ui":
-            scale = float(self._trace_span_ui) / float(max(1, self._num_samples_per_trace))
-            return np.asarray(x_grid_sample * scale, dtype=np.float64), scale, "Time (UI)"
-        if unit in {"sec", "second", "seconds"}:
-            unit = "s"
-        elif unit in {"millisecond", "milliseconds"}:
-            unit = "ms"
-        elif unit in {"microsecond", "microseconds"}:
-            unit = "us"
-        elif unit in {"nanosecond", "nanoseconds"}:
-            unit = "ns"
-        elif unit in {"picosecond", "picoseconds"}:
-            unit = "ps"
-        time_scale = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9, "ps": 1e12}
-        if unit in time_scale:
-            if self._sample_rate_hz <= 0:
-                raise ValueError("sample_rate_hz must be >0 for time-axis units.")
-            scale = float(time_scale[unit]) / float(self._sample_rate_hz)
-            return np.asarray(x_grid_sample * scale, dtype=np.float64), scale, f"Time ({unit})"
-        raise ValueError(
-            "Unsupported x_unit. Use one of: sample, ui, s/second, ms, us, ns, ps."
-        )
-
-    @staticmethod
-    def _scale_mask_x(
-        geometry: tuple[float, float, float, float],
-        x_scale: float,
-    ) -> tuple[float, float, float, float]:
-        x_left, x_right, y_bot, y_top = geometry
-        return float(x_left * x_scale), float(x_right * x_scale), float(y_bot), float(y_top)
 
     @staticmethod
     def _circular_delta(x: float, ref: float, period: float) -> float:
@@ -168,73 +99,10 @@ class EyeMonitor:
         right = min(right_crosses) if right_crosses else None
         return left, right
 
-    @staticmethod
-    def _ber_from_sigma(sigma: float | None) -> Optional[float]:
-        if sigma is None:
-            return None
-        s = float(sigma)
-        if not np.isfinite(s):
-            return None
-        return float(norm.sf(s))
-
-    @staticmethod
-    def _sigma_from_ber(ber: float | None) -> Optional[float]:
-        if ber is None:
-            return None
-        b = float(ber)
-        if not np.isfinite(b):
-            return None
-        b = min(max(b, 1e-300), 0.5 - 1e-15)
-        return float(norm.isf(b))
-
-    @classmethod
-    def _trace_ber_mapping(cls, n_traces: int) -> dict[str, Any]:
-        n = int(max(0, n_traces))
-        if n <= 0:
-            return {
-                "ber_floor_estimate": None,
-                "sigma_limit_estimate": None,
-                "sigma_to_ber": {},
-                "sigma_to_min_traces": {},
-            }
-        ber_floor = 1.0 / float(n)
-        sigma_limit = cls._sigma_from_ber(ber_floor)
-        sigma_points = [1, 2, 3, 4, 5, 6, 7]
-        sigma_to_ber = {str(s): float(cls._ber_from_sigma(float(s)) or 0.0) for s in sigma_points}
-        sigma_to_min_traces = {
-            str(s): int(np.ceil(1.0 / max(sigma_to_ber[str(s)], 1e-300)))
-            for s in sigma_points
-        }
-        return {
-            "ber_floor_estimate": float(ber_floor),
-            "sigma_limit_estimate": sigma_limit,
-            "sigma_to_ber": sigma_to_ber,
-            "sigma_to_min_traces": sigma_to_min_traces,
-        }
-
-    @classmethod
-    def _attach_trace_ber_mapping(cls, metrics: dict[str, Any], n_traces: int) -> dict[str, Any]:
-        out = dict(metrics)
-        out.update(cls._trace_ber_mapping(n_traces))
-        return out
-
-    @staticmethod
-    def _resolve_mask_sigma(metrics: dict[str, Any], requested_sigma: float) -> tuple[float, bool]:
-        req = float(max(0.0, requested_sigma))
-        sigma_limit = metrics.get("sigma_limit_estimate")
-        if sigma_limit is None:
-            return req, False
-        lim = float(sigma_limit)
-        if not np.isfinite(lim):
-            return req, False
-        if req > lim:
-            return lim, True
-        return req, False
-
     def get_eye_metrics(self, interp_step: float = 0.1) -> dict[str, Any]:
         x_grid, interp_traces = self._build_interpolated_traces(interp_step=interp_step)
         if len(interp_traces) == 0:
-            return self._attach_trace_ber_mapping({
+            return {
                 "threshold": None,
                 "x_center": self._num_samples_per_trace / 2.0,
                 "upper_amp_mean": None,
@@ -258,7 +126,7 @@ class EyeMonitor:
                 "eye_width_mean": None,
                 "eye_width_std": None,
                 "n_traces": 0,
-            }, 0)
+            }
 
         y_all = np.vstack(interp_traces)
         x_center_ref = self._num_samples_per_trace / 2.0
@@ -273,7 +141,7 @@ class EyeMonitor:
             high_vals = center_vals[center_vals >= threshold]
             low_vals = center_vals[center_vals < threshold]
         if high_vals.size == 0 or low_vals.size == 0:
-            return self._attach_trace_ber_mapping({
+            return {
                 "threshold": threshold,
                 "x_center": float(x_center_ref),
                 "upper_amp_mean": None,
@@ -297,7 +165,7 @@ class EyeMonitor:
                 "eye_width_mean": None,
                 "eye_width_std": None,
                 "n_traces": len(interp_traces),
-            }, len(interp_traces))
+            }
 
         upper_amp_mean = float(np.mean(high_vals))
         upper_amp_std = float(np.std(high_vals))
@@ -462,7 +330,7 @@ class EyeMonitor:
         else:
             eye_width_std = None
 
-        return self._attach_trace_ber_mapping({
+        return {
             "threshold": threshold,
             "x_center": float(x_center),
             "upper_amp_mean": upper_amp_mean,
@@ -486,7 +354,7 @@ class EyeMonitor:
             "eye_width_mean": eye_width_mean,
             "eye_width_std": eye_width_std,
             "n_traces": len(interp_traces),
-        }, len(interp_traces))
+        }
 
     @staticmethod
     def _mask_geometry(
@@ -525,177 +393,6 @@ class EyeMonitor:
         if not (x_right > x_left and y_top > y_bot):
             return None
         return x_left, x_right, y_bot, y_top
-
-    @staticmethod
-    def _internal_open_geometry(metrics: dict[str, Any]) -> Optional[tuple[float, float, float, float]]:
-        """Return internal open-eye geometry from measured mean eye statistics."""
-        left = metrics.get("left_edge_mean")
-        right = metrics.get("right_edge_mean")
-        lower = metrics.get("lower_amp_mean")
-        upper = metrics.get("upper_amp_mean")
-        if left is None or right is None or lower is None or upper is None:
-            return None
-        x_left = float(left)
-        x_right = float(right)
-        y_bot = float(lower)
-        y_top = float(upper)
-        if not (x_right > x_left and y_top > y_bot):
-            return None
-        return x_left, x_right, y_bot, y_top
-
-    @staticmethod
-    def _draw_internal_open_markers_matplotlib(
-        ax: Axes,
-        geometry: tuple[float, float, float, float],
-        color: str = "darkorange",
-    ) -> None:
-        """Draw internal eye-width and eye-height markers on a matplotlib axis."""
-        x_left, x_right, y_bot, y_top = geometry
-        width = x_right - x_left
-        height = y_top - y_bot
-        if width <= 0 or height <= 0:
-            return
-
-        x_center = 0.5 * (x_left + x_right)
-        y_center = 0.5 * (y_bot + y_top)
-        x_min, x_max = ax.get_xlim()
-        y_min, y_max = ax.get_ylim()
-        x_span = max(float(x_max) - float(x_min), 1e-12)
-        y_span = max(float(y_max) - float(y_min), 1e-12)
-        y_off = 0.02 * y_span
-        x_off = 0.02 * x_span
-
-        ax.annotate(
-            "",
-            xy=(x_left, y_bot),
-            xytext=(x_right, y_bot),
-            arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
-        )
-        ax.annotate(
-            "",
-            xy=(x_center, y_bot),
-            xytext=(x_center, y_top),
-            arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
-        )
-        ax.plot([x_center], [y_center], marker="x", color=color, markersize=6, markeredgewidth=1.4)
-        ax.text(
-            x_center,
-            y_bot - y_off,
-            f"Eye Width: {width:.3f}",
-            color=color,
-            ha="center",
-            va="top",
-            fontsize=9,
-            bbox=dict(facecolor="white", edgecolor=color, alpha=0.85, boxstyle="round,pad=0.2"),
-        )
-        ax.text(
-            x_center + x_off,
-            y_center,
-            f"Eye Height: {height:.3f}",
-            color=color,
-            ha="left",
-            va="center",
-            fontsize=9,
-            bbox=dict(facecolor="white", edgecolor=color, alpha=0.85, boxstyle="round,pad=0.2"),
-        )
-
-    @staticmethod
-    def _draw_internal_open_markers_plotly(
-        fig,
-        geometry: tuple[float, float, float, float],
-        color: str = "darkorange",
-    ) -> None:
-        """Draw internal eye-width and eye-height markers on a Plotly figure."""
-        x_left, x_right, y_bot, y_top = geometry
-        width = x_right - x_left
-        height = y_top - y_bot
-        if width <= 0 or height <= 0:
-            return
-
-        x_center = 0.5 * (x_left + x_right)
-        y_center = 0.5 * (y_bot + y_top)
-        fig.add_annotation(
-            x=x_left,
-            y=y_bot,
-            ax=x_right,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_right,
-            y=y_bot,
-            ax=x_left,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_bot,
-            ax=x_center,
-            ay=y_top,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_top,
-            ax=x_center,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_bot,
-            yshift=-14,
-            text=f"Eye Width: {width:.3f}",
-            showarrow=False,
-            font=dict(color=color),
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor=color,
-            borderwidth=1,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_center,
-            xshift=24,
-            text=f"Eye Height: {height:.3f}",
-            showarrow=False,
-            font=dict(color=color),
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor=color,
-            borderwidth=1,
-        )
 
     @staticmethod
     def _draw_mask_matplotlib(
@@ -742,7 +439,6 @@ class EyeMonitor:
         ax: Axes,
         geometry: tuple[float, float, float, float],
         color: str = "crimson",
-        stat_line: Optional[str] = None,
     ) -> None:
         x_left, x_right, y_bot, y_top = geometry
         mask_w = x_right - x_left
@@ -780,25 +476,9 @@ class EyeMonitor:
             fontsize=9,
             bbox=dict(facecolor="white", edgecolor=color, alpha=0.8, boxstyle="round,pad=0.2"),
         )
-        if stat_line:
-            ax.text(
-                x_center,
-                y_top + label_off,
-                stat_line,
-                color=color,
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                bbox=dict(facecolor="white", edgecolor=color, alpha=0.8, boxstyle="round,pad=0.2"),
-            )
 
     @staticmethod
-    def _label_mask_plotly(
-        fig,
-        geometry: tuple[float, float, float, float],
-        color: str = "crimson",
-        stat_line: Optional[str] = None,
-    ) -> None:
+    def _label_mask_plotly(fig, geometry: tuple[float, float, float, float], color: str = "crimson") -> None:
         x_left, x_right, y_bot, y_top = geometry
         mask_w = x_right - x_left
         mask_h = y_top - y_bot
@@ -846,18 +526,6 @@ class EyeMonitor:
             bordercolor=color,
             borderwidth=1,
         )
-        if stat_line:
-            fig.add_annotation(
-                x=x_center,
-                y=y_top,
-                yshift=14,
-                text=stat_line,
-                showarrow=False,
-                font=dict(color=color),
-                bgcolor="rgba(255,255,255,0.85)",
-                bordercolor=color,
-                borderwidth=1,
-            )
 
     def plot(
         self,
@@ -865,8 +533,6 @@ class EyeMonitor:
         mask_type: Optional[str] = None,
         mask_sigma: float = 1.0,
         interp_step: float = 0.1,
-        x_unit: str = "ui",
-        show_internal_open_markers: bool = True,
         return_metrics: bool = False,
     ):
         if ax is None:
@@ -875,48 +541,20 @@ class EyeMonitor:
             ax = self._ax
 
         ax.clear()
+        ax.set_xlabel("Sample Index")
         ax.set_ylabel("Amplitude (V)")
         ax.grid(True, which="both", alpha=0.3)
 
         x_grid, interp_traces = self._build_interpolated_traces(interp_step=interp_step)
-        x_plot, x_scale, x_label = self._x_axis_transform(x_grid, x_unit=x_unit)
-        ax.set_xlabel(x_label)
         for trace_interp in interp_traces:
-            ax.plot(x_plot, trace_interp, color=(0, 0, 1, 0.2), linewidth=1)
-        if x_plot.size > 0:
-            ax.set_xlim(float(np.min(x_plot)), float(np.max(x_plot)))
+            ax.plot(x_grid, trace_interp, color=(0, 0, 1, 0.2), linewidth=1)
 
         metrics = self.get_eye_metrics(interp_step=interp_step)
-        metrics["x_axis_unit"] = str(x_unit)
-        metrics["x_scale_from_sample"] = float(x_scale)
-        if metrics.get("x_center") is not None:
-            metrics["x_center_in_unit"] = float(metrics["x_center"]) * float(x_scale)
-        if bool(show_internal_open_markers):
-            open_geom = self._internal_open_geometry(metrics)
-            if open_geom is not None:
-                open_geom_plot = self._scale_mask_x(open_geom, x_scale=float(x_scale))
-                self._draw_internal_open_markers_matplotlib(ax, open_geom_plot)
-                metrics["internal_open_geometry"] = {
-                    "x_left": float(open_geom_plot[0]),
-                    "x_right": float(open_geom_plot[1]),
-                    "y_bot": float(open_geom_plot[2]),
-                    "y_top": float(open_geom_plot[3]),
-                }
         if mask_type in {"rectangle", "diamond"}:
-            effective_sigma, sigma_limited = self._resolve_mask_sigma(metrics, requested_sigma=float(mask_sigma))
-            ber_eff = self._ber_from_sigma(effective_sigma)
-            stat_line = f"sigma={effective_sigma:.2f}, BER~{float(ber_eff or 0.0):.2e}"
-            if sigma_limited:
-                stat_line += " (trace-limited)"
-            geometry = self._mask_geometry(metrics, mask_sigma=float(effective_sigma))
+            geometry = self._mask_geometry(metrics, mask_sigma=float(mask_sigma))
             if geometry is not None:
-                geometry_plot = self._scale_mask_x(geometry, x_scale=float(x_scale))
-                self._draw_mask_matplotlib(ax, geometry_plot, mask_type=mask_type)
-                self._label_mask_matplotlib(ax, geometry_plot, stat_line=stat_line)
-            metrics["mask_sigma_requested"] = float(mask_sigma)
-            metrics["mask_sigma_effective"] = float(effective_sigma)
-            metrics["mask_sigma_trace_limited"] = bool(sigma_limited)
-            metrics["mask_ber_effective"] = ber_eff
+                self._draw_mask_matplotlib(ax, geometry, mask_type=mask_type)
+                self._label_mask_matplotlib(ax, geometry)
 
         if return_metrics:
             return ax, metrics
@@ -927,8 +565,6 @@ class EyeMonitor:
         mask_type: Optional[str] = None,
         mask_sigma: float = 1.0,
         interp_step: float = 0.1,
-        x_unit: str = "ui",
-        show_internal_open_markers: bool = True,
         show: bool = True,
     ):
         try:
@@ -937,12 +573,11 @@ class EyeMonitor:
             raise ImportError("plotly is required for plot_plotly(); install with `pip install plotly`.") from exc
 
         x_grid, interp_traces = self._build_interpolated_traces(interp_step=interp_step)
-        x_plot, x_scale, x_label = self._x_axis_transform(x_grid, x_unit=x_unit)
         fig = go.Figure()
         for trace_interp in interp_traces:
             fig.add_trace(
                 go.Scatter(
-                    x=x_plot,
+                    x=x_grid,
                     y=trace_interp,
                     mode="lines",
                     line=dict(color="rgba(0, 0, 255, 0.2)", width=1),
@@ -952,30 +587,10 @@ class EyeMonitor:
             )
 
         metrics = self.get_eye_metrics(interp_step=interp_step)
-        metrics["x_axis_unit"] = str(x_unit)
-        metrics["x_scale_from_sample"] = float(x_scale)
-        if metrics.get("x_center") is not None:
-            metrics["x_center_in_unit"] = float(metrics["x_center"]) * float(x_scale)
-        if bool(show_internal_open_markers):
-            open_geom = self._internal_open_geometry(metrics)
-            if open_geom is not None:
-                open_geom_plot = self._scale_mask_x(open_geom, x_scale=float(x_scale))
-                self._draw_internal_open_markers_plotly(fig, open_geom_plot)
-                metrics["internal_open_geometry"] = {
-                    "x_left": float(open_geom_plot[0]),
-                    "x_right": float(open_geom_plot[1]),
-                    "y_bot": float(open_geom_plot[2]),
-                    "y_top": float(open_geom_plot[3]),
-                }
         if mask_type in {"rectangle", "diamond"}:
-            effective_sigma, sigma_limited = self._resolve_mask_sigma(metrics, requested_sigma=float(mask_sigma))
-            ber_eff = self._ber_from_sigma(effective_sigma)
-            stat_line = f"sigma={effective_sigma:.2f}, BER~{float(ber_eff or 0.0):.2e}"
-            if sigma_limited:
-                stat_line += " (trace-limited)"
-            geometry = self._mask_geometry(metrics, mask_sigma=float(effective_sigma))
+            geometry = self._mask_geometry(metrics, mask_sigma=float(mask_sigma))
             if geometry is not None:
-                x0, x1, y0, y1 = self._scale_mask_x(geometry, x_scale=float(x_scale))
+                x0, x1, y0, y1 = geometry
                 x_center = (x0 + x1) / 2.0
                 y_center = (y0 + y1) / 2.0
                 if mask_type == "rectangle":
@@ -1000,20 +615,14 @@ class EyeMonitor:
                         line=dict(color="crimson", width=2),
                         fillcolor="rgba(220, 20, 60, 0.08)",
                     )
-                self._label_mask_plotly(fig, geometry, stat_line=stat_line)
-            metrics["mask_sigma_requested"] = float(mask_sigma)
-            metrics["mask_sigma_effective"] = float(effective_sigma)
-            metrics["mask_sigma_trace_limited"] = bool(sigma_limited)
-            metrics["mask_ber_effective"] = ber_eff
+                self._label_mask_plotly(fig, geometry)
 
         fig.update_layout(
             title="Eye Diagram (Interactive)",
-            xaxis_title=x_label,
+            xaxis_title="Sample Index",
             yaxis_title="Amplitude (V)",
             template="plotly_white",
         )
-        if x_plot.size > 0:
-            fig.update_xaxes(range=[float(np.min(x_plot)), float(np.max(x_plot))])
         if show:
             fig.show()
         return fig, metrics

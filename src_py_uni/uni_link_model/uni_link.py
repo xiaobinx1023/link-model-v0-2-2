@@ -10,6 +10,7 @@ import numpy.typing as npt
 from scipy import interpolate
 
 from src_py.link_model.channel import Channel
+from src_py.link_model.clock import Clock
 from src_py.link_model.clock_gen import ClockGen
 from src_py.link_model.data_gen import DataGen, Pattern
 from src_py.link_model.driver import Driver
@@ -29,6 +30,103 @@ class ChanData:
     S_full: npt.NDArray[np.complex128]
 
 
+def _merge_interleaved_edge_clocks(clks: list[Clock], n_streams: int) -> Clock:
+    """Merge interleaved phase streams into a positive-edge data clock."""
+    active = [c for c in clks if c.is_pos_edge]
+    if not active:
+        return Clock()
+
+    chosen = active[0]
+    for c in active[1:]:
+        if float(c.frac_dly) < float(chosen.frac_dly):
+            chosen = c
+
+    out = chosen.copy()
+    per = float(chosen.period)
+    n = max(1, int(n_streams))
+    out.period = per / float(n) if per > 0.0 else 0.0
+    return out
+
+
+class AggressorDriverLane:
+    """
+    Per-aggressor TX/RX lane model used for patterned aggressor drive:
+      PI(tx/rx) -> DataGen -> Driver
+
+    The lane inherits the same termination assumptions as victim modeling
+    in `UniDirLink.update_impulses()`. This class provides per-port pattern
+    and PI-code controls to configure aggressor/victim phase relationship.
+    """
+
+    def __init__(
+        self,
+        pattern: Pattern = Pattern.PRBS31,
+        amplitude: float = Driver.AVDD,
+        tx_pi_code: int = 0,
+        rx_pi_code: int = 0,
+        txrx_rate_mode: str = "full",
+    ) -> None:
+        """Initialize aggressor lane generator, PI blocks, and defaults."""
+        self.pattern = Pattern(pattern)
+        self.amplitude = float(amplitude)
+        self.tx_pi_code = int(tx_pi_code)
+        self.rx_pi_code = int(rx_pi_code)
+        self.txrx_rate_mode = str(txrx_rate_mode).strip().lower()
+
+        self._phase_offsets = self._interleave_phase_offsets(self.txrx_rate_mode)
+        self._tx_pis = [PI() for _ in self._phase_offsets]
+        self._rx_pis = [PI() for _ in self._phase_offsets]
+        self.tx_pi = self._tx_pis[0]
+        self.rx_pi = self._rx_pis[0]
+        self.data_gen = DataGen(pattern=self.pattern)
+        self.driver = Driver()
+
+    @staticmethod
+    def _interleave_phase_offsets(mode: str) -> tuple[int, ...]:
+        """Return default interleaved phase offsets for a rate mode."""
+        m = str(mode).strip().lower()
+        if m == "dual":
+            return (0, 2 * PI.PHASE_CODE_PER_QUAD)
+        if m == "quarter":
+            return (
+                0,
+                PI.PHASE_CODE_PER_QUAD,
+                2 * PI.PHASE_CODE_PER_QUAD,
+                3 * PI.PHASE_CODE_PER_QUAD,
+            )
+        return (0,)
+
+    def run(self, clk_i, clk_q) -> float:
+        """Advance the aggressor lane by one sample and return its source voltage."""
+        tx_clk_candidates: list[Clock] = []
+        for pi, ph_ofs in zip(self._tx_pis, self._phase_offsets):
+            pi.clk_in_i = clk_i
+            pi.clk_in_q = clk_q
+            pi.phase_code = int((int(self.tx_pi_code) + int(ph_ofs)) % 128)
+            pi.run()
+            tx_clk_candidates.append(pi.clk_out)
+
+        for pi, ph_ofs in zip(self._rx_pis, self._phase_offsets):
+            pi.clk_in_i = clk_i
+            pi.clk_in_q = clk_q
+            pi.phase_code = int((int(self.rx_pi_code) + int(ph_ofs)) % 128)
+            pi.run()
+
+        tx_clk = _merge_interleaved_edge_clocks(tx_clk_candidates, n_streams=len(self._phase_offsets))
+
+        self.data_gen.clk = tx_clk
+        self.data_gen.pattern = Pattern(self.pattern)
+        self.data_gen.run()
+
+        self.driver.clk = tx_clk
+        self.driver.in_ = int(self.data_gen.out)
+        self.driver.run()
+
+        if float(Driver.AVDD) == 0.0:
+            return 0.0
+        return float(self.driver.out) * (float(self.amplitude) / float(Driver.AVDD))
+
+
 class UniDirLink:
     """
     Unidirectional link model:
@@ -40,11 +138,16 @@ class UniDirLink:
     as the victim lane.
     """
 
-    SAMP_FREQ_HZ = 32e9 * 16
-    CLK_FREQ_HZ = 32e9
+    SAMP_FREQ_HZ = 16e9 * 16
+    CLK_FREQ_HZ = 16e9
     CHAN_RES_FREQ_HZ = 100e6
     Z0 = 50.0
     IMP_DELAY_PS = 64.0
+    _DATA_RATE_MULT_BY_MODE = {
+        "full": 1.0,
+        "dual": 2.0,
+        "quarter": 4.0,
+    }
 
     def __init__(
         self,
@@ -59,21 +162,42 @@ class UniDirLink:
         rx_clk_ofst: float | None = None,
         rx_slicer_ref: float | None = None,
         rx_pd_out_gain: float = 0.0,
+        txrx_rate_mode: str = "full",
+        txrx_clock_freq_hz: float | None = None,
+        clk_dcd_ui: float = 0.0,
+        clk_iq_mismatch_ui: float = 0.0,
         channel_pairs: list[tuple[int, int]] | None = None,
         aggressor_ports: list[int] | None = None,
         aggressor_enable: bool = True,
     ) -> None:
+        """Initialize a unidirectional link model and all dependent blocks."""
         self.chan_file = str(chan_file)
         self.chan_port_tx_sel = int(chan_port_tx_sel)
         self.chan_port_rx_sel = int(chan_port_rx_sel)
+        self.txrx_rate_mode, self.txrx_period_ui_scale = self._normalize_txrx_rate_mode(txrx_rate_mode)
+        clk_f = float(self.CLK_FREQ_HZ if txrx_clock_freq_hz is None else txrx_clock_freq_hz)
+        self._txrx_clock_freq_hz = max(clk_f, 1e-9)
+        self.clk_dcd_ui = float(clk_dcd_ui)
+        self.clk_iq_mismatch_ui = float(clk_iq_mismatch_ui)
         self.io_term = UniIOTerminationModel(z0_ohm=self.Z0)
 
         self.tx = TxFFE()
         self.rx = Rx()
         self.chan = Channel()
-        self.clk_src = ClockGen(self.CLK_FREQ_HZ, self.SAMP_FREQ_HZ)
-        self.tx_pi = PI()
-        self.rx_pi = PI()
+        self.clk_src = ClockGen(
+            self._txrx_clock_freq_hz,
+            self.SAMP_FREQ_HZ,
+            period_ui_scale=1.0,
+            duty_cycle_distortion=(self.clk_dcd_ui / self.txrx_period_ui_scale),
+            iq_phase_mismatch=(self.clk_iq_mismatch_ui / self.txrx_period_ui_scale),
+        )
+        self._interleave_phase_offsets = self._interleave_phase_offsets_for_mode(self.txrx_rate_mode)
+        self._tx_pis = [PI() for _ in self._interleave_phase_offsets]
+        self._rx_pis = [PI() for _ in self._interleave_phase_offsets]
+        self.tx_pi = self._tx_pis[0]
+        self.rx_pi = self._rx_pis[0]
+        self.tx_clk_out = Clock()
+        self.rx_clk_out = Clock()
 
         self.tx_pattern = Pattern(tx_pattern)
         self.tx_pi_code = int(tx_pi_code)
@@ -83,9 +207,10 @@ class UniDirLink:
         if tx_ffe_taps is not None:
             self.tx.set_ffe_taps(tx_ffe_taps)
 
-        self.rx.samples_per_ui = int(round(self.SAMP_FREQ_HZ / self.CLK_FREQ_HZ))
+        self.rx.samples_per_ui = int(self.data_ui_samples)
         self.rx.sample_rate_hz = self.SAMP_FREQ_HZ
         self.rx.clk_ofst = float(self.rx.samples_per_ui / 4.0 if rx_clk_ofst is None else rx_clk_ofst)
+        self._normalize_rx_clk_offset_for_pd()
         self.rx.ref = float(0.5 * Driver.AVDD if rx_slicer_ref is None else rx_slicer_ref)
         self.rx.pd_out_gain = float(rx_pd_out_gain)
 
@@ -142,7 +267,10 @@ class UniDirLink:
         self.aggressor_port_src: dict[int, float] = {}
         self.aggressor_pattern_by_port: dict[int, Pattern] = {}
         self.aggressor_amplitude_by_port: dict[int, float] = {}
+        self.aggressor_tx_pi_code_by_port: dict[int, int] = {}
+        self.aggressor_rx_pi_code_by_port: dict[int, int] = {}
         self._aggressor_data_gen: dict[int, DataGen] = {}
+        self._aggressor_lane_by_port: dict[int, AggressorDriverLane] = {}
         self.set_aggressor_ports(aggressor_ports)
 
     @staticmethod
@@ -151,6 +279,7 @@ class UniDirLink:
         y_old: npt.ArrayLike,
         x_new: npt.ArrayLike,
     ) -> npt.NDArray[np.complex128]:
+        """Interpolate a complex impulse response at fractional index positions."""
         interp_r = interpolate.interp1d(
             x_old,
             np.real(y_old),
@@ -167,7 +296,71 @@ class UniDirLink:
         )
         return np.asarray(interp_r(x_new) + 1j * interp_i(x_new), dtype=np.complex128)
 
+    @staticmethod
+    def _normalize_txrx_rate_mode(mode: str | None) -> tuple[str, float]:
+        """Normalize rate mode text and return mode with period scale."""
+        key = "full" if mode is None else str(mode).strip().lower()
+        mode_map = {
+            "full": ("full", 1.0),
+            "dual": ("dual", 2.0),
+            "quarter": ("quarter", 4.0),
+            "quater": ("quarter", 4.0),  # tolerate common typo
+        }
+        if key not in mode_map:
+            allowed = "full, dual, quarter"
+            raise ValueError(f"Unsupported txrx_rate_mode '{mode}'. Use one of: {allowed}.")
+        canon, scale = mode_map[key]
+        return canon, float(scale)
+
+    @staticmethod
+    def _interleave_phase_offsets_for_mode(mode: str) -> tuple[int, ...]:
+        """Return TX/RX interleave phase offsets for the selected rate mode."""
+        m = str(mode).strip().lower()
+        if m == "dual":
+            return (0, 2 * PI.PHASE_CODE_PER_QUAD)
+        if m == "quarter":
+            return (
+                0,
+                PI.PHASE_CODE_PER_QUAD,
+                2 * PI.PHASE_CODE_PER_QUAD,
+                3 * PI.PHASE_CODE_PER_QUAD,
+            )
+        return (0,)
+
+    @property
+    def txrx_clock_freq_hz(self) -> float:
+        """Return the effective TX/RX clock frequency in Hz."""
+        return float(self._txrx_clock_freq_hz)
+
+    @property
+    def data_rate_hz(self) -> float:
+        """Return the effective serial data rate in Hz for the selected mode."""
+        mult = float(self._DATA_RATE_MULT_BY_MODE.get(self.txrx_rate_mode, 1.0))
+        return float(self.txrx_clock_freq_hz * mult)
+
+    @property
+    def data_ui_samples(self) -> int:
+        """Return the number of simulation samples per data UI."""
+        rate = float(self.data_rate_hz)
+        if rate <= 0.0:
+            return 1
+        return max(1, int(round(float(self.SAMP_FREQ_HZ) / rate)))
+
+    def _normalize_rx_clk_offset_for_pd(self) -> float:
+        """Normalize RX edge-clock offset to a non-degenerate in-UI position."""
+        ui = float(max(1, int(self.rx.samples_per_ui)))
+        ofs = float(self.rx.clk_ofst)
+        ofs = float(np.fmod(ofs, ui))
+        if ofs < 0.0:
+            ofs += ui
+        # Avoid 0/1UI alignment where edge and data samples coincide.
+        if np.isclose(ofs, 0.0, atol=1e-9) or np.isclose(ofs, ui, atol=1e-9):
+            ofs = 0.5 * ui
+        self.rx.clk_ofst = float(ofs)
+        return float(ofs)
+
     def _normalize_channel_pairs(self, channel_pairs: list[tuple[int, int]] | None) -> list[tuple[int, int]]:
+        """Normalize and validate channel port-pair definitions."""
         n_ports = self.chan_data.S_full.shape[0]
         if channel_pairs is None:
             if n_ports % 2 != 0:
@@ -194,6 +387,7 @@ class UniDirLink:
         return pairs
 
     def _find_pair_for_ports(self, p0: int, p1: int) -> tuple[int, int] | None:
+        """Find the configured channel pair that matches two ports."""
         target = {int(p0), int(p1)}
         for a, b in self.channel_pairs:
             if {a, b} == target:
@@ -201,6 +395,7 @@ class UniDirLink:
         return None
 
     def get_channel_pair_for_port(self, port: int) -> tuple[int, int] | None:
+        """Return the channel pair containing the given port, if any."""
         p_i = int(port)
         for a, b in self.channel_pairs:
             if p_i == a or p_i == b:
@@ -209,6 +404,7 @@ class UniDirLink:
 
     @staticmethod
     def _get_leg_in_pair(port: int, pair: tuple[int, int]) -> int | None:
+        """Return pair leg index for a port within a channel pair."""
         p_i = int(port)
         if p_i == pair[0]:
             return 0
@@ -217,6 +413,7 @@ class UniDirLink:
         return None
 
     def _build_port_tx_side_map(self) -> dict[int, bool]:
+        """Build a map indicating whether each port is TX-side."""
         out: dict[int, bool] = {}
         tx_leg = int(self._victim_tx_leg)
         for a, b in self.channel_pairs:
@@ -233,6 +430,7 @@ class UniDirLink:
 
     def _default_aggressor_ports(self) -> list[int]:
         # One source per aggressor lane: choose TX-side port from each non-victim pair.
+        """Return default aggressor ports based on victim and channel mapping."""
         victim_pair_set = {self.victim_pair[0], self.victim_pair[1]}
         ports: list[int] = []
         for a, b in self.channel_pairs:
@@ -244,6 +442,7 @@ class UniDirLink:
         return ports
 
     def _normalize_aggressor_ports(self, aggressor_ports: list[int] | None) -> list[int]:
+        """Normalize, validate, and deduplicate aggressor port list."""
         n_ports = self.chan_data.S_full.shape[0]
         victim_ports = {self.chan_port_tx_sel, self.chan_port_rx_sel}
         if aggressor_ports is None:
@@ -266,6 +465,7 @@ class UniDirLink:
 
     @staticmethod
     def _normalize_pattern(pattern: Pattern | int | str) -> Pattern:
+        """Normalize a pattern input to the Pattern enum."""
         if isinstance(pattern, Pattern):
             return Pattern(pattern)
         if isinstance(pattern, str):
@@ -279,10 +479,21 @@ class UniDirLink:
                 f"Unsupported aggressor pattern '{pattern}'. Use Pattern enum/name/value."
             ) from exc
 
+    @staticmethod
+    def _normalize_pi_code(code: int) -> int:
+        """Normalize PI code to the supported wrapped integer range."""
+        code_i = int(code)
+        if code_i < PI.MIN_PHASE_CODE or code_i > PI.MAX_PHASE_CODE:
+            raise ValueError(f"PI code must be in [{PI.MIN_PHASE_CODE}, {PI.MAX_PHASE_CODE}], got {code_i}.")
+        return code_i
+
     def set_aggressor_ports(self, aggressor_ports: list[int] | None) -> None:
+        """Set aggressor port list and rebuild lane resources as needed."""
         prev_src = dict(getattr(self, "aggressor_port_src", {}))
         prev_pat = dict(getattr(self, "aggressor_pattern_by_port", {}))
         prev_amp = dict(getattr(self, "aggressor_amplitude_by_port", {}))
+        prev_tx_pi = dict(getattr(self, "aggressor_tx_pi_code_by_port", {}))
+        prev_rx_pi = dict(getattr(self, "aggressor_rx_pi_code_by_port", {}))
         self.aggressor_ports = self._normalize_aggressor_ports(aggressor_ports)
         self.aggressor_port_src = {p: float(prev_src.get(p, 0.0)) for p in self.aggressor_ports}
         self.aggressor_pattern_by_port = {
@@ -291,14 +502,29 @@ class UniDirLink:
         self.aggressor_amplitude_by_port = {
             p: float(prev_amp.get(p, Driver.AVDD)) for p in self.aggressor_ports
         }
+        self.aggressor_tx_pi_code_by_port = {
+            p: self._normalize_pi_code(prev_tx_pi.get(p, self.tx_pi_code)) for p in self.aggressor_ports
+        }
+        self.aggressor_rx_pi_code_by_port = {
+            p: self._normalize_pi_code(prev_rx_pi.get(p, self.rx_pi_code)) for p in self.aggressor_ports
+        }
         self._aggressor_data_gen = {}
+        self._aggressor_lane_by_port = {}
         for p in self.aggressor_ports:
-            dg = DataGen(pattern=self.aggressor_pattern_by_port[p])
-            self._aggressor_data_gen[p] = dg
+            lane = AggressorDriverLane(
+                pattern=self.aggressor_pattern_by_port[p],
+                amplitude=self.aggressor_amplitude_by_port[p],
+                tx_pi_code=self.aggressor_tx_pi_code_by_port[p],
+                rx_pi_code=self.aggressor_rx_pi_code_by_port[p],
+                txrx_rate_mode=self.txrx_rate_mode,
+            )
+            self._aggressor_lane_by_port[p] = lane
+            self._aggressor_data_gen[p] = lane.data_gen
             self.aggressor_port_src[p] = float(prev_src.get(p, 0.0))
         self.update_impulses()
 
     def set_aggressor_sources(self, sources: dict[int, float]) -> None:
+        """Set manual aggressor source voltages by port."""
         for p, val in sources.items():
             p_i = int(p)
             if p_i not in self.aggressor_port_src:
@@ -306,9 +532,11 @@ class UniDirLink:
             self.aggressor_port_src[p_i] = float(val)
 
     def set_aggressor_enable(self, enabled: bool) -> None:
+        """Enable or disable aggressor contribution in the run loop."""
         self.aggressor_enable = bool(enabled)
 
     def set_aggressor_source_mode(self, mode: str) -> None:
+        """Set aggressor source mode to manual or pattern driven."""
         mode_l = str(mode).strip().lower()
         if mode_l not in {"manual", "pattern"}:
             raise ValueError("aggressor source mode must be 'manual' or 'pattern'")
@@ -320,20 +548,30 @@ class UniDirLink:
         pattern: Pattern | int | str,
         amplitude: float | None = None,
     ) -> None:
+        """Set aggressor data pattern and optional amplitude for one port."""
         port = int(aggressor_port)
         if port not in self.aggressor_pattern_by_port:
             raise ValueError(f"Aggressor port {port} is not enabled. Enabled ports: {self.aggressor_ports}")
         pat = self._normalize_pattern(pattern)
         self.aggressor_pattern_by_port[port] = pat
-        self._aggressor_data_gen[port].pattern = pat
+        lane = self._aggressor_lane_by_port.get(port)
+        if lane is not None:
+            lane.pattern = pat
+            lane.data_gen.pattern = pat
+        elif port in self._aggressor_data_gen:
+            self._aggressor_data_gen[port].pattern = pat
         if amplitude is not None:
-            self.aggressor_amplitude_by_port[port] = float(amplitude)
+            amp = float(amplitude)
+            self.aggressor_amplitude_by_port[port] = amp
+            if lane is not None:
+                lane.amplitude = amp
 
     def set_aggressor_patterns(
         self,
         patterns: dict[int, Pattern | int | str],
         amplitude: float | None = None,
     ) -> None:
+        """Apply per-port aggressor patterns from a dictionary."""
         for p, pat in patterns.items():
             self.set_aggressor_pattern(int(p), pat, amplitude=amplitude)
 
@@ -342,29 +580,96 @@ class UniDirLink:
         pattern: Pattern | int | str,
         amplitude: float | None = None,
     ) -> None:
+        """Apply one pattern and optional amplitude to all aggressor ports."""
         pat = self._normalize_pattern(pattern)
         for p in self.aggressor_ports:
             self.set_aggressor_pattern(p, pat, amplitude=amplitude)
 
     def broadcast_aggressor_amplitude(self, amplitude: float) -> None:
+        """Set one amplitude value for all aggressor ports."""
         amp = float(amplitude)
         for p in self.aggressor_ports:
             self.aggressor_amplitude_by_port[p] = amp
+            lane = self._aggressor_lane_by_port.get(p)
+            if lane is not None:
+                lane.amplitude = amp
+
+    def set_aggressor_pi_codes(
+        self,
+        aggressor_port: int,
+        tx_pi_code: int | None = None,
+        rx_pi_code: int | None = None,
+    ) -> None:
+        """Set TX/RX PI codes for a specific aggressor lane."""
+        port = int(aggressor_port)
+        if port not in self.aggressor_ports:
+            raise ValueError(f"Aggressor port {port} is not enabled. Enabled ports: {self.aggressor_ports}")
+        lane = self._aggressor_lane_by_port.get(port)
+        if tx_pi_code is not None:
+            tx_code = self._normalize_pi_code(tx_pi_code)
+            self.aggressor_tx_pi_code_by_port[port] = tx_code
+            if lane is not None:
+                lane.tx_pi_code = tx_code
+        if rx_pi_code is not None:
+            rx_code = self._normalize_pi_code(rx_pi_code)
+            self.aggressor_rx_pi_code_by_port[port] = rx_code
+            if lane is not None:
+                lane.rx_pi_code = rx_code
+
+    def broadcast_aggressor_pi_codes(
+        self,
+        tx_pi_code: int | None = None,
+        rx_pi_code: int | None = None,
+    ) -> None:
+        """Apply TX/RX PI codes to all aggressor lanes."""
+        for p in self.aggressor_ports:
+            self.set_aggressor_pi_codes(p, tx_pi_code=tx_pi_code, rx_pi_code=rx_pi_code)
+
+    def set_aggressor_phase_offsets(
+        self,
+        aggressor_port: int,
+        tx_phase_offset_code: int = 0,
+        rx_phase_offset_code: int = 0,
+    ) -> None:
+        """Set interleaved phase offsets for a specific aggressor lane."""
+        port = int(aggressor_port)
+        if port not in self.aggressor_ports:
+            raise ValueError(f"Aggressor port {port} is not enabled. Enabled ports: {self.aggressor_ports}")
+        code_mod = PI.MAX_PHASE_CODE + 1
+        victim_rx_code = int(self.rx.pi_code) if float(self.rx.pd_out_gain) != 0.0 else int(self.rx_pi_code)
+        tx_code = (int(self.tx_pi_code) + int(tx_phase_offset_code)) % code_mod
+        rx_code = (victim_rx_code + int(rx_phase_offset_code)) % code_mod
+        self.set_aggressor_pi_codes(port, tx_pi_code=tx_code, rx_pi_code=rx_code)
+
+    def broadcast_aggressor_phase_offsets(
+        self,
+        tx_phase_offset_code: int = 0,
+        rx_phase_offset_code: int = 0,
+    ) -> None:
+        """Apply interleaved phase offsets to all aggressor lanes."""
+        for p in self.aggressor_ports:
+            self.set_aggressor_phase_offsets(
+                p,
+                tx_phase_offset_code=tx_phase_offset_code,
+                rx_phase_offset_code=rx_phase_offset_code,
+            )
 
     def _update_aggressor_sources_from_patterns(self) -> None:
+        """Update aggressor source voltages from current pattern generators."""
         if not self.aggressor_enable or self.aggressor_source_mode != "pattern":
             return
         for p in self.aggressor_ports:
-            dg = self._aggressor_data_gen.get(p)
-            if dg is None:
+            lane = self._aggressor_lane_by_port.get(p)
+            if lane is None:
                 continue
-            dg.clk = self.tx_pi.clk_out
-            dg.run()
-            bit = int(dg.out)
-            amp = float(self.aggressor_amplitude_by_port.get(p, Driver.AVDD))
-            self.aggressor_port_src[p] = amp * float(bit)
+            lane.pattern = Pattern(self.aggressor_pattern_by_port.get(p, lane.pattern))
+            lane.amplitude = float(self.aggressor_amplitude_by_port.get(p, lane.amplitude))
+            lane.tx_pi_code = int(self.aggressor_tx_pi_code_by_port.get(p, lane.tx_pi_code))
+            lane.rx_pi_code = int(self.aggressor_rx_pi_code_by_port.get(p, lane.rx_pi_code))
+            self.aggressor_port_src[p] = float(lane.run(self.clk_src.clk_i, self.clk_src.clk_q))
 
     def load_chan_data(self) -> ChanData:
+        """Load network parameters and build per-port channel tables."""
         snp_freq, snp_data, _, _, _ = Tools.parse_snp_file(self.chan_file)
         s_full = snp_data.astype(np.complex128, copy=True)
         n_ports = s_full.shape[0]
@@ -399,12 +704,14 @@ class UniDirLink:
         return ChanData(freq=snp_freq_new, S=s, S_full=s_full_i)
 
     def _impulse_signature(self) -> tuple[float, ...]:
+        """Return a compact signature for channel impulse cache invalidation."""
         taps = tuple(float(x) for x in np.asarray(self.tx.ffe_taps, dtype=np.float64).reshape(-1))
         aggr = tuple(float(p) for p in self.aggressor_ports)
         return taps + (float(self.rx_term_code),) + aggr
 
     @staticmethod
     def _par(z1: complex, z2: complex) -> complex:
+        """Return the equivalent impedance of two parallel impedances."""
         return complex(1.0 / (1.0 / z1 + 1.0 / z2))
 
     def _solve_loaded_network(
@@ -413,6 +720,7 @@ class UniDirLink:
         gamma_load: npt.NDArray[np.complex128],
         src_idx: int,
     ) -> tuple[npt.NDArray[np.complex128], complex]:
+        """Solve loaded network voltage distribution for all active ports."""
         n_ports = s_full_f.shape[0]
         e_src = np.zeros(n_ports, dtype=np.complex128)
         e_src[src_idx] = 1.0
@@ -438,6 +746,7 @@ class UniDirLink:
         z_tx: npt.NDArray[np.complex128],
         z_rx: npt.NDArray[np.complex128],
     ) -> npt.NDArray[np.complex128]:
+        """Build complex load impedance vector for each model port."""
         n_ports = self.chan_data.S_full.shape[0]
         out = np.empty(n_ports, dtype=np.complex128)
         z_tx_i = complex(z_tx[freq_idx])
@@ -447,11 +756,13 @@ class UniDirLink:
         return out
 
     def _classify_xtalk(self, aggressor_port: int, victim_port: int) -> str:
+        """Classify aggressor coupling as NEXT or FEXT relative to victim side."""
         aggr_side = bool(self._port_is_tx_side.get(int(aggressor_port), True))
         vic_side = bool(self._port_is_tx_side.get(int(victim_port), True))
         return "FEXT" if aggr_side != vic_side else "NEXT"
 
     def update_impulses(self) -> None:
+        """Recompute victim and aggressor impulse responses from current settings."""
         freq = self.chan_data.freq
         self.tf_freq = freq
         n_freq = freq.size
@@ -556,31 +867,40 @@ class UniDirLink:
         self._last_impulse_signature = self._impulse_signature()
 
     def _update_impulses_if_needed(self) -> None:
+        """Refresh cached impulses when key configuration has changed."""
         sig = self._impulse_signature()
         if self._last_impulse_signature is None or sig != self._last_impulse_signature:
             self.update_impulses()
 
     def run(self) -> None:
+        """Advance TX, channel, aggressors, and RX by one simulation sample."""
         self._update_impulses_if_needed()
 
         self.clk_src.run()
 
-        self.tx_pi.clk_in_i = self.clk_src.clk_i
-        self.tx_pi.clk_in_q = self.clk_src.clk_q
-        self.tx_pi.phase_code = int(self.tx_pi_code)
-        self.tx_pi.run()
+        tx_clks: list[Clock] = []
+        for pi, ph_ofs in zip(self._tx_pis, self._interleave_phase_offsets):
+            pi.clk_in_i = self.clk_src.clk_i
+            pi.clk_in_q = self.clk_src.clk_q
+            pi.phase_code = int((int(self.tx_pi_code) + int(ph_ofs)) % 128)
+            pi.run()
+            tx_clks.append(pi.clk_out)
 
-        self.rx_pi.clk_in_i = self.clk_src.clk_i
-        self.rx_pi.clk_in_q = self.clk_src.clk_q
-        # If PD loop gain is enabled, let RX CDR update PI code.
-        # Otherwise keep fixed phase from rx_pi_code.
-        if float(self.rx.pd_out_gain) != 0.0:
-            self.rx_pi.phase_code = int(self.rx.pi_code)
-        else:
-            self.rx_pi.phase_code = int(self.rx_pi_code)
-        self.rx_pi.run()
+        rx_code_base = int(self.rx.pi_code) if float(self.rx.pd_out_gain) != 0.0 else int(self.rx_pi_code)
+        rx_clks: list[Clock] = []
+        for pi, ph_ofs in zip(self._rx_pis, self._interleave_phase_offsets):
+            pi.clk_in_i = self.clk_src.clk_i
+            pi.clk_in_q = self.clk_src.clk_q
+            pi.phase_code = int((int(rx_code_base) + int(ph_ofs)) % 128)
+            pi.run()
+            rx_clks.append(pi.clk_out)
 
-        self.tx.clk = self.tx_pi.clk_out
+        tx_clk = _merge_interleaved_edge_clocks(tx_clks, n_streams=len(self._interleave_phase_offsets))
+        rx_clk = _merge_interleaved_edge_clocks(rx_clks, n_streams=len(self._interleave_phase_offsets))
+        self.tx_clk_out = tx_clk.copy()
+        self.rx_clk_out = rx_clk.copy()
+
+        self.tx.clk = tx_clk
         self.tx.data_gen_pattern = Pattern(self.tx_pattern)
         self.tx.run()
         self._update_aggressor_sources_from_patterns()
@@ -602,11 +922,13 @@ class UniDirLink:
         self.rx_in = float(self._filt_chan_to_rx.run(self.rx_bump))
         self.rx_xtalk_in = float(self._filt_chan_to_rx_xtalk.run(self.rx_xtalk_bump))
 
-        self.rx.clk = self.rx_pi.clk_out
+        self._normalize_rx_clk_offset_for_pd()
+        self.rx.clk = rx_clk
         self.rx.din = self.rx_in
         self.rx.run()
 
     def get_aggressor_victim_pulse_response(self, aggressor_port: int, include_total: bool = True) -> dict[str, Any]:
+        """Return pulse responses from one aggressor to victim observation points."""
         port = int(aggressor_port)
         if port not in self.imp_xtalk_to_rx_bump_by_port:
             raise ValueError(
@@ -626,6 +948,7 @@ class UniDirLink:
         aggressor_port: int,
         victim_port: int,
     ) -> dict[str, Any]:
+        """Return aggressor-to-victim pulse response for a selected victim port."""
         aggr = int(aggressor_port)
         vic = int(victim_port)
         victim_ports = {int(self.chan_port_tx_sel), int(self.chan_port_rx_sel)}
@@ -655,6 +978,7 @@ class UniDirLink:
         require_coupling: str | None = None,
         time_unit: str = "ns",
     ) -> dict[str, Any]:
+        """Plot aggressor-to-victim pulse response for one port pair."""
         data = self.get_aggressor_to_victim_port_pulse_response(
             aggressor_port=aggressor_port,
             victim_port=victim_port,
@@ -685,6 +1009,7 @@ class UniDirLink:
         return data
 
     def plot_path_impulses(self, time_unit: str = "ns") -> None:
+        """Plot key path impulse responses for the active victim path."""
         unit_scale = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9, "ps": 1e12}
         if time_unit not in unit_scale:
             raise ValueError(f"Unsupported time_unit '{time_unit}'. Use one of {list(unit_scale.keys())}.")

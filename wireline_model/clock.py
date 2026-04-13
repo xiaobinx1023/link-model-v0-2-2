@@ -14,16 +14,13 @@ class Clock:
 
     @property
     def is_pos_edge(self) -> bool:
-        """Return True when this sample is a positive clock edge."""
         return self.is_edge and self.is_pos
 
     @property
     def is_neg_edge(self) -> bool:
-        """Return True when this sample is a negative clock edge."""
         return self.is_edge and (not self.is_pos)
 
     def copy(self) -> "Clock":
-        """Return a value copy of this clock sample."""
         return Clock(
             is_edge=self.is_edge,
             is_pos=self.is_pos,

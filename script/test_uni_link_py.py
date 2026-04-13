@@ -16,7 +16,18 @@ from src_py.link_model.driver import Driver
 from src_py_uni.uni_link_model import UniDirLink
 
 
+def _get_data_ui_samples(link: UniDirLink) -> int:
+    """Return the number of simulation samples that correspond to one data UI."""
+    if hasattr(link, "data_ui_samples"):
+        return int(getattr(link, "data_ui_samples"))
+    data_rate_hz = float(getattr(link, "data_rate_hz", float(link.CLK_FREQ_HZ)))
+    if data_rate_hz <= 0.0:
+        return 1
+    return max(1, int(round(float(link.SAMP_FREQ_HZ) / data_rate_hz)))
+
+
 def _get_monitor_definitions() -> dict[str, tuple[str, Callable[[UniDirLink], float]]]:
+    """Return supported pulse-monitor keys and their signal getters."""
     return {
         "tx_drv_out": ("TX driver out", lambda lk: float(lk.tx_drv_out)),
         "tx_to_chan": ("TX -> channel", lambda lk: float(lk.tx_to_chan)),
@@ -31,6 +42,7 @@ def _get_monitor_definitions() -> dict[str, tuple[str, Callable[[UniDirLink], fl
 
 
 def _resolve_monitor_keys(monitor_keys: list[str] | None) -> list[tuple[str, str, Callable[[UniDirLink], float]]]:
+    """Validate monitor keys and return resolved monitor definitions."""
     defs = _get_monitor_definitions()
     if monitor_keys is None:
         keys = list(defs.keys())
@@ -57,7 +69,10 @@ def _plot_monitor_traces(
     pulse_start_ns: float | None = None,
     pulse_end_ns: float | None = None,
     cursor_samples_by_monitor: dict[str, dict[str, int]] | None = None,
+    baseline_by_monitor: dict[str, float] | None = None,
+    cursor_magnitudes_by_monitor: dict[str, dict[str, float]] | None = None,
 ) -> None:
+    """Plot 1UI pulse monitor traces with cursor and baseline annotations."""
     n = len(monitors)
     if n == 0:
         return
@@ -71,6 +86,9 @@ def _plot_monitor_traces(
         ax.plot(t_ns, traces[key], linewidth=1.1)
         if pulse_start_ns is not None and pulse_end_ns is not None:
             ax.axvspan(pulse_start_ns, pulse_end_ns, color="orange", alpha=0.15)
+        if baseline_by_monitor is not None and key in baseline_by_monitor:
+            baseline = float(baseline_by_monitor[key])
+            ax.axhline(baseline, color="gray", linestyle="--", linewidth=0.9, alpha=0.7)
         if cursor_samples_by_monitor is not None:
             cursor_spec = [
                 ("pre", "tab:purple", ":"),
@@ -88,8 +106,13 @@ def _plot_monitor_traces(
                 y = float(traces[key][idx])
                 ax.axvline(x, color=ccolor, linestyle=cstyle, linewidth=1.0, alpha=0.8)
                 ax.plot([x], [y], marker="o", color=ccolor, markersize=4)
+                mag_txt = ""
+                if cursor_magnitudes_by_monitor is not None:
+                    mag = cursor_magnitudes_by_monitor.get(key, {}).get(cname)
+                    if mag is not None and np.isfinite(float(mag)):
+                        mag_txt = f" ({float(mag):+.3e})"
                 ax.annotate(
-                    cname,
+                    f"{cname}{mag_txt}",
                     xy=(x, y),
                     xytext=(4, 4),
                     textcoords="offset points",
@@ -113,6 +136,7 @@ def _estimate_cursor_samples_by_monitor(
     ui_samples: int,
     monitor_order: list[str],
 ) -> dict[str, dict[str, int]]:
+    """Estimate pre/main/post cursor sample indices for each monitor."""
     if ui_samples <= 0:
         return {
             key: {"pre": -1, "main": -1, "post1": -1, "post2": -1, "post3": -1}
@@ -138,6 +162,59 @@ def _estimate_cursor_samples_by_monitor(
     return out
 
 
+def _estimate_baseline_and_cursor_magnitudes_by_monitor(
+    traces: dict[str, np.ndarray],
+    cursor_samples_by_monitor: dict[str, dict[str, int]],
+    ui_samples: int,
+    pulse_start: int,
+    pulse_end: int,
+    monitor_order: list[str],
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Estimate baseline and cursor magnitudes relative to that baseline."""
+    baseline_by_monitor: dict[str, float] = {}
+    cursor_magnitudes_by_monitor: dict[str, dict[str, float]] = {}
+    ui = max(1, int(ui_samples))
+    for key in monitor_order:
+        y = np.asarray(traces.get(key, np.array([], dtype=np.float64)), dtype=np.float64).reshape(-1)
+        if y.size == 0:
+            baseline_by_monitor[key] = float("nan")
+            cursor_magnitudes_by_monitor[key] = {
+                "pre": float("nan"),
+                "main": float("nan"),
+                "post1": float("nan"),
+                "post2": float("nan"),
+                "post3": float("nan"),
+            }
+            continue
+
+        pre_end = max(1, min(int(pulse_start - ui), y.size))
+        pre_start = max(0, pre_end - max(16, 2 * ui))
+        pre_vals = y[pre_start:pre_end]
+
+        post_start = min(y.size, max(0, int(pulse_end + 2 * ui)))
+        post_vals = y[post_start:]
+
+        baseline_pool = np.concatenate([pre_vals, post_vals]) if pre_vals.size > 0 and post_vals.size > 0 else (
+            post_vals if post_vals.size > 0 else pre_vals
+        )
+        if baseline_pool.size == 0:
+            baseline = float(np.mean(y))
+        else:
+            baseline = float(np.mean(baseline_pool))
+        baseline_by_monitor[key] = baseline
+
+        cdict = cursor_samples_by_monitor.get(key, {})
+        mags: dict[str, float] = {}
+        for cname in ("pre", "main", "post1", "post2", "post3"):
+            idx = int(cdict.get(cname, -1))
+            if 0 <= idx < y.size:
+                mags[cname] = float(y[idx] - baseline)
+            else:
+                mags[cname] = float("nan")
+        cursor_magnitudes_by_monitor[key] = mags
+    return baseline_by_monitor, cursor_magnitudes_by_monitor
+
+
 def run_1ui_pulse_response(
     link: UniDirLink,
     monitor_keys: list[str] | None = None,
@@ -147,7 +224,7 @@ def run_1ui_pulse_response(
     """
     monitors = _resolve_monitor_keys(monitor_keys)
 
-    ui_samples = int(round(link.SAMP_FREQ_HZ / link.CLK_FREQ_HZ))
+    ui_samples = _get_data_ui_samples(link)
     warmup = 128
     pulse_len = ui_samples
     tail = 256
@@ -186,6 +263,14 @@ def run_1ui_pulse_response(
         ui_samples=ui_samples,
         monitor_order=monitor_order,
     )
+    baseline_by_monitor, cursor_magnitudes_by_monitor = _estimate_baseline_and_cursor_magnitudes_by_monitor(
+        traces=traces,
+        cursor_samples_by_monitor=cursor_samples_by_monitor,
+        ui_samples=ui_samples,
+        pulse_start=pulse_start,
+        pulse_end=pulse_end,
+        monitor_order=monitor_order,
+    )
     _plot_monitor_traces(
         t_ns=t_ns,
         traces=traces,
@@ -194,6 +279,8 @@ def run_1ui_pulse_response(
         pulse_start_ns=pulse_start_ns,
         pulse_end_ns=pulse_end_ns,
         cursor_samples_by_monitor=cursor_samples_by_monitor,
+        baseline_by_monitor=baseline_by_monitor,
+        cursor_magnitudes_by_monitor=cursor_magnitudes_by_monitor,
     )
 
     cursor_time_ns_by_monitor = {
@@ -206,6 +293,10 @@ def run_1ui_pulse_response(
 
     cursor_samples = cursor_samples_by_monitor.get(monitor_order[0], {}) if len(monitor_order) > 0 else {}
     cursor_time_ns = cursor_time_ns_by_monitor.get(monitor_order[0], {}) if len(monitor_order) > 0 else {}
+    baseline_value = baseline_by_monitor.get(monitor_order[0], float("nan")) if len(monitor_order) > 0 else float("nan")
+    cursor_magnitudes = (
+        cursor_magnitudes_by_monitor.get(monitor_order[0], {}) if len(monitor_order) > 0 else {}
+    )
 
     return {
         "time_ns": t_ns,
@@ -213,8 +304,12 @@ def run_1ui_pulse_response(
         "monitor_traces": traces,
         "cursor_samples_by_monitor": cursor_samples_by_monitor,
         "cursor_time_ns_by_monitor": cursor_time_ns_by_monitor,
+        "baseline_by_monitor": baseline_by_monitor,
+        "cursor_magnitudes_by_monitor": cursor_magnitudes_by_monitor,
         "cursor_samples": cursor_samples,
         "cursor_time_ns": cursor_time_ns,
+        "baseline": baseline_value,
+        "cursor_magnitudes": cursor_magnitudes,
         "ui_samples": ui_samples,
         "pulse_start_sample": pulse_start,
         "pulse_end_sample": pulse_end,
@@ -231,6 +326,7 @@ def run_prbs(
     aggressor_pattern_overrides: dict[int, Pattern] | None = None,
     aggressor_seed: int = 20260304,
 ) -> dict[str, np.ndarray]:
+    """Run PRBS simulation and return captured RX and CDR traces."""
     link.tx_pattern = Pattern.PRBS23
     link.set_aggressor_enable(bool(with_aggressors))
     mode = str(aggressor_drive_mode).strip().lower()
@@ -271,7 +367,7 @@ def run_prbs(
         rx_post_ctle[i] = float(link.rx.din_ctle)
         rx_post_ap[i] = float(link.rx.din_apertured)
 
-        if link.tx_pi.clk_out.is_edge:
+        if link.tx.clk.is_edge:
             tx_data_edges.append(int(link.tx.data_center))
             if mode == "manual_random" and with_aggressors and link.aggressor_ports:
                 aggr_src = {
@@ -281,7 +377,7 @@ def run_prbs(
             elif mode == "manual_random" and link.aggressor_ports:
                 aggr_src = {p: 0.0 for p in link.aggressor_ports}
 
-        if link.rx_pi.clk_out.is_edge:
+        if link.rx.clk.is_edge:
             rx_data_edges.append(int(link.rx.data))
             rx_pi_code.append(int(link.rx.pi_code))
             rx_pd_out.append(int(link.rx._pd_out))
@@ -300,6 +396,7 @@ def run_prbs(
 
 
 def _build_default_link(chan_file: Path, rx_pd_out_gain: float) -> UniDirLink:
+    """Build a default uni-directional link for standalone script usage."""
     link = UniDirLink(
         chan_file=chan_file,
         chan_port_tx_sel=7,
@@ -329,6 +426,7 @@ def _build_default_link(chan_file: Path, rx_pd_out_gain: float) -> UniDirLink:
 
 
 def main() -> None:
+    """CLI entry point for running the specs-based test wrapper."""
     chan_file = ROOT / "data" / "A1_Combined_models_Slice_C_clocks_Slice_D_Data.s10p"
     rx_pd_out_gain = 0.125
 

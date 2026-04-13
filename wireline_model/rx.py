@@ -16,7 +16,6 @@ from .slicer import Slicer
 
 class Rx:
     def __init__(self) -> None:
-        """Initialize receiver state, controls, and processing blocks."""
         self.clk = Clock()
         self.din = 0.0
         self.clk_ofst = 0.0
@@ -35,7 +34,6 @@ class Rx:
         self.slicer_sensitivity = 0.0
         self.slicer_aperture_ui = 0.0
         self.samples_per_ui = 16
-        self.eye_trace_span_ui = 2.0
         self.sample_rate_hz = 256e9
 
         self.data = 0
@@ -67,7 +65,6 @@ class Rx:
         self._edge_slicer = Slicer()
 
     def _configure_blocks(self) -> None:
-        """Apply user-facing RX settings to internal processing blocks."""
         self._ctle.enabled = bool(self.ctle_en)
         self._ctle.configure(
             sample_rate_hz=float(self.sample_rate_hz),
@@ -89,22 +86,8 @@ class Rx:
         ap_samps = int(round(ap_ui * float(self.samples_per_ui)))
         self._aperture.aperture_samples = max(1, ap_samps)
 
-        # Eye trace length should match the configured UI span.
-        eye_trace_samples = int(round(float(self.samples_per_ui) * float(self.eye_trace_span_ui)))
-        eye_trace_samples = max(1, eye_trace_samples)
-        self._eye_monitor.configure_timing(
-            num_samples_per_trace=eye_trace_samples,
-            sample_rate_hz=float(self.sample_rate_hz),
-            trace_span_ui=float(self.eye_trace_span_ui),
-        )
-
     def run(self) -> None:
-        """Run one RX processing step for the current input sample and clock."""
         self._configure_blocks()
-
-        # Keep PI accumulator aligned to externally forced code when CDR is disabled.
-        if float(self.pd_out_gain) == 0.0:
-            self._pi_code_acc = float(int(self.pi_code) % 128)
 
         self._clk_data = self.clk.copy()
         self._clk_delayline.delay = self.clk_ofst
@@ -117,18 +100,13 @@ class Rx:
         self.din_eq = float(self.din_ctle - self.dfe_feedback)
         self.din_apertured = self._aperture.run(self.din_eq)
 
-        edge_for_pd = int(self._edge)
         if self._clk_edge.is_edge:
             self._edge_ana = (1 - self._clk_edge.frac_dly) * self._din_prev + self._clk_edge.frac_dly * self.din_apertured
             self._edge = self._edge_slicer.run(self._edge_ana, self.ref)
-            # If edge/data both occur in the same sample, only use the new edge
-            # when it happened earlier in fractional time.
-            if (not self._clk_data.is_edge) or (float(self._clk_edge.frac_dly) < float(self._clk_data.frac_dly)):
-                edge_for_pd = int(self._edge)
 
         if self._clk_data.is_edge:
             self._data_prev = self.data
-            self._edge_prev = int(edge_for_pd)
+            self._edge_prev = self._edge
             self._data_ana = (1 - self._clk_data.frac_dly) * self._din_prev + self._clk_data.frac_dly * self.din_apertured
             self.data = self._data_slicer.run(self._data_ana, self.ref)
 
@@ -141,8 +119,8 @@ class Rx:
             else:
                 self._pd_out = 0
 
-            self._pi_code_acc = float((self._pi_code_acc - self.pd_out_gain * self._pd_out) % 128.0)
-            self.pi_code = int(math.floor(self._pi_code_acc)) % 128
+            self._pi_code_acc = (self._pi_code_acc - self.pd_out_gain * self._pd_out) % 128
+            self.pi_code = int(math.floor(self._pi_code_acc))
             self._dfe.update(self.data)
 
         self._din_prev = float(self.din_apertured)
@@ -151,40 +129,28 @@ class Rx:
         self._eye_monitor.data_in = float(self.din_apertured)
         self._eye_monitor.run()
 
-    def reset_eye_monitor(self) -> None:
-        """Clear accumulated eye traces while preserving timing configuration."""
-        self._configure_blocks()
-        self._eye_monitor.clear()
-
     def plot_eye(self, ax=None, **kwargs):
-        """Plot the accumulated eye diagram using matplotlib."""
         return self._eye_monitor.plot(ax=ax, **kwargs)
 
     def plot_eye_plotly(self, **kwargs):
-        """Plot the accumulated eye diagram using Plotly."""
         return self._eye_monitor.plot_plotly(**kwargs)
 
     def get_eye_metrics(self, **kwargs):
-        """Return eye metrics from the eye monitor."""
         return self._eye_monitor.get_eye_metrics(**kwargs)
 
     def get_ctle_impulse_response(self, n_samples: int = 256):
-        """Return CTLE impulse response for the current configuration."""
         self._configure_blocks()
         return self._ctle.impulse_response(n_samples=n_samples)
 
     def get_ctle_frequency_response(self, n_points: int = 1024):
-        """Return CTLE frequency response for the current configuration."""
         self._configure_blocks()
         return self._ctle.frequency_response(n_points=n_points)
 
     def get_ctle_response_metrics(self, n_points: int = 4096):
-        """Return CTLE response metrics for the current configuration."""
         self._configure_blocks()
         return self._ctle.response_metrics(n_points=n_points)
 
     def get_ctle_design_info(self):
-        """Return CTLE design details for the current configuration."""
         self._configure_blocks()
         return self._ctle.get_design_info()
 
@@ -194,7 +160,6 @@ class Rx:
         level: int = logging.INFO,
         log_response_queries: bool = False,
     ) -> None:
-        """Configure CTLE logging behavior and verbosity."""
         self._ctle.set_logging(
             enabled=enabled,
             level=level,
@@ -202,5 +167,4 @@ class Rx:
         )
 
     def set_ctle_name(self, name: str) -> None:
-        """Set a display name for the CTLE instance."""
         self._ctle.set_instance_name(name)

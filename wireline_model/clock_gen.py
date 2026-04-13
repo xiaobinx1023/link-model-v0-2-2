@@ -11,16 +11,10 @@ class ClockGen:
         freq_hz: float = 16e9,
         sample_freq_hz: float = 16e9 * 16,
         abs_jitter_std_sec: float = 0.01e-12,
-        period_ui_scale: float = 1.0,
-        duty_cycle_distortion: float = 0.0,
-        iq_phase_mismatch: float = 0.0,
     ) -> None:
         self.freq_hz = float(freq_hz)
         self.sample_freq_hz = float(sample_freq_hz)
         self.abs_jitter_std_sec = float(abs_jitter_std_sec)
-        self.period_ui_scale = max(float(period_ui_scale), 1e-9)
-        self.duty_cycle_distortion = float(duty_cycle_distortion)
-        self.iq_phase_mismatch = float(iq_phase_mismatch)
 
         self.clk_i = Clock()
         self.clk_q = Clock()
@@ -31,49 +25,14 @@ class ClockGen:
         self._period = self.nominal_period + self._period_jitter
 
         self._timer = 0.0
-        self._clk_q_pos_edge_timer_val = 0.0
-        self._clk_i_neg_edge_timer_val = 0.0
-        self._clk_q_neg_edge_timer_val = 0.0
-        self._clk_i_pos_edge_timer_val = 0.0
-        self._reset_cycle_timers(carry_frac=0.0)
+        self._clk_q_pos_edge_timer_val = self._period / 4.0
+        self._clk_i_neg_edge_timer_val = self._period / 2.0
+        self._clk_q_neg_edge_timer_val = self._period * 3.0 / 4.0
+        self._clk_i_pos_edge_timer_val = self._period
 
     @property
     def nominal_period(self) -> float:
-        return (self.sample_freq_hz / self.freq_hz) * self.period_ui_scale
-
-    @staticmethod
-    def _clamp(value: float, lo: float, hi: float) -> float:
-        return float(max(lo, min(hi, value)))
-
-    @staticmethod
-    def _normalize_edge_pos(pos: float, period: float) -> float:
-        eps = 1e-9
-        x = float(pos) % float(period)
-        if x <= eps:
-            x = eps
-        if x >= float(period) - eps:
-            x = float(period) - eps
-        return x
-
-    def _edge_offsets_in_cycle(self, period: float) -> tuple[float, float, float, float]:
-        # DCD controls high/low asymmetry around 50%.
-        half_frac = self._clamp(0.5 + float(self.duty_cycle_distortion), 0.05, 0.95)
-        # IQ mismatch is phase skew of Q relative to ideal 90-degree quadrature.
-        q_phase_frac = float(0.25 + float(self.iq_phase_mismatch))
-
-        i_neg = self._normalize_edge_pos(float(period) * half_frac, period)
-        q_pos = self._normalize_edge_pos(float(period) * q_phase_frac, period)
-        q_neg = self._normalize_edge_pos(q_pos + float(period) * half_frac, period)
-        i_pos = float(period)
-        return q_pos, i_neg, q_neg, i_pos
-
-    def _reset_cycle_timers(self, carry_frac: float) -> None:
-        q_pos, i_neg, q_neg, i_pos = self._edge_offsets_in_cycle(self._period)
-        carry = float(carry_frac)
-        self._clk_q_pos_edge_timer_val = q_pos - carry
-        self._clk_i_neg_edge_timer_val = i_neg - carry
-        self._clk_q_neg_edge_timer_val = q_neg - carry
-        self._clk_i_pos_edge_timer_val = i_pos - carry
+        return self.sample_freq_hz / self.freq_hz
 
     @staticmethod
     def _set_clock_edge(clk: Clock, is_pos: bool, frac_dly: float, period: float) -> None:
@@ -133,4 +92,8 @@ class ClockGen:
             self._period = self.nominal_period + self._period_jitter
 
             self._timer = 0.0
-            self._reset_cycle_timers(carry_frac=(1 - self.clk_i.frac_dly))
+            self._clk_i_pos_edge_timer_val = self._period - (1 - self.clk_i.frac_dly)
+            self._clk_q_pos_edge_timer_val = self._period / 4.0 - (1 - self.clk_i.frac_dly)
+            self._clk_i_neg_edge_timer_val = self._period / 2.0 - (1 - self.clk_i.frac_dly)
+            self._clk_q_neg_edge_timer_val = self._period * 3.0 / 4.0 - (1 - self.clk_i.frac_dly)
+

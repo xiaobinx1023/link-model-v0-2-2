@@ -7,7 +7,7 @@ from .fir import FIR
 
 
 class Channel:
-    FILTER_LEN = 256
+    FILTER_LEN = 128
 
     def __init__(
         self,

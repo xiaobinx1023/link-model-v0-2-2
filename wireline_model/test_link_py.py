@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.typing as npt
 from scipy import signal
 
 try:
@@ -134,7 +136,7 @@ def _apply_controller_config(ctrl: Controller, cfg: ControllerConfig) -> None:
 
 
 def _parse_csv_floats(raw: str, expected_len: int, field_name: str) -> list[float]:
-    items = [x.strip() for x in raw.split(",") if x.strip()]
+    items = _tokenize_numeric_list(raw)
     if len(items) != expected_len:
         raise ValueError(f"{field_name} expects {expected_len} values, got {len(items)}: '{raw}'")
     try:
@@ -144,7 +146,7 @@ def _parse_csv_floats(raw: str, expected_len: int, field_name: str) -> list[floa
 
 
 def _parse_csv_floats_var(raw: str, field_name: str) -> list[float]:
-    items = [x.strip() for x in raw.split(",") if x.strip()]
+    items = _tokenize_numeric_list(raw)
     if len(items) == 0:
         return []
     try:
@@ -153,14 +155,42 @@ def _parse_csv_floats_var(raw: str, field_name: str) -> list[float]:
         raise ValueError(f"{field_name} must contain numeric values: '{raw}'") from exc
 
 
+def _tokenize_numeric_list(raw: str) -> list[str]:
+    txt = str(raw).strip()
+    if txt == "":
+        return []
+    for ch in "[](){}":
+        txt = txt.replace(ch, " ")
+    txt = txt.replace(";", ",")
+    return [tok for tok in re.split(r"[,\s]+", txt) if tok]
+
+
+def _parse_float_required(raw: str, field_name: str) -> float:
+    txt = str(raw).strip()
+    if txt == "":
+        raise ValueError(f"{field_name} must be numeric and cannot be empty")
+    try:
+        v = float(txt)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be numeric: '{raw}'") from exc
+    if not np.isfinite(v):
+        raise ValueError(f"{field_name} must be finite: '{raw}'")
+    return float(v)
+
+
+def _parse_int_required(raw: str, field_name: str) -> int:
+    v = _parse_float_required(raw, field_name)
+    v_i = int(round(v))
+    if abs(v - float(v_i)) > 1e-9:
+        raise ValueError(f"{field_name} must be an integer value: '{raw}'")
+    return int(v_i)
+
+
 def _parse_optional_float(raw: str, field_name: str) -> float | None:
-    txt = raw.strip()
+    txt = str(raw).strip()
     if txt == "":
         return None
-    try:
-        return float(txt)
-    except ValueError as exc:
-        raise ValueError(f"{field_name} must be numeric or empty: '{raw}'") from exc
+    return _parse_float_required(txt, field_name)
 
 
 class LinkConfigGUI:
@@ -216,11 +246,14 @@ class LinkConfigGUI:
             master_cfg = self._parse_controller_tab(self._master_vars, "Master")
             slave_cfg = self._parse_controller_tab(self._slave_vars, "Slave")
 
-            num_cycles = int(self._sim_vars["num_cycles"].get().strip())
+            num_cycles = _parse_int_required(str(self._sim_vars["num_cycles"].get()), "num_cycles")
             if num_cycles <= 0:
                 raise ValueError("num_cycles must be > 0")
 
-            aggressor_amplitude = float(self._sim_vars["aggressor_amplitude"].get().strip())
+            aggressor_amplitude = _parse_float_required(
+                str(self._sim_vars["aggressor_amplitude"].get()),
+                "aggressor_amplitude",
+            )
             run_pulse_response = bool(self._sim_vars["run_pulse_response"].get())
 
             self._result = GuiRunConfig(
@@ -331,13 +364,13 @@ class LinkConfigGUI:
         vars_out["rx_ctle_dc_gain_db"] = rx_ctle_dc_gain_db_var
         row += 1
 
-        ttk.Label(parent, text="rx_ctle_peaking_gain_db").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(parent, text="rx_ctle_peaking_gain_db (gain-peak mode)").grid(row=row, column=0, sticky="w", pady=4)
         rx_ctle_peaking_gain_db_var = tk.StringVar(value=f"{default.rx_ctle_peaking_gain_db:g}")
         ttk.Entry(parent, textvariable=rx_ctle_peaking_gain_db_var).grid(row=row, column=1, sticky="ew", pady=4)
         vars_out["rx_ctle_peaking_gain_db"] = rx_ctle_peaking_gain_db_var
         row += 1
 
-        ttk.Label(parent, text="rx_ctle_peaking_freq_hz").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(parent, text="rx_ctle_peaking_freq_hz (gain-peak mode)").grid(row=row, column=0, sticky="w", pady=4)
         peak_freq_text = "" if default.rx_ctle_peaking_freq_hz is None else f"{default.rx_ctle_peaking_freq_hz:g}"
         rx_ctle_peaking_freq_hz_var = tk.StringVar(value=peak_freq_text)
         ttk.Entry(parent, textvariable=rx_ctle_peaking_freq_hz_var).grid(row=row, column=1, sticky="ew", pady=4)
@@ -427,16 +460,22 @@ class LinkConfigGUI:
         tx_echo_drv_inv_pol = [bool(v.get()) for v in vars_map["tx_echo_drv_inv_pol"]]
         tx_echo_drv_en = bool(vars_map["tx_echo_drv_en"].get())
 
-        tx_pi_code = int(str(vars_map["tx_pi_code"].get()).strip())
+        tx_pi_code = _parse_int_required(str(vars_map["tx_pi_code"].get()), f"{name}.tx_pi_code")
         if tx_pi_code < 0 or tx_pi_code > 127:
             raise ValueError(f"{name}.tx_pi_code must be in [0, 127]")
 
-        rx_clk_ofset = int(str(vars_map["rx_clk_ofset"].get()).strip())
-        rx_slc_ref = float(str(vars_map["rx_slc_ref"].get()).strip())
-        rx_pd_out_gain = float(str(vars_map["rx_pd_out_gain"].get()).strip())
+        rx_clk_ofset = _parse_int_required(str(vars_map["rx_clk_ofset"].get()), f"{name}.rx_clk_ofset")
+        rx_slc_ref = _parse_float_required(str(vars_map["rx_slc_ref"].get()), f"{name}.rx_slc_ref")
+        rx_pd_out_gain = _parse_float_required(str(vars_map["rx_pd_out_gain"].get()), f"{name}.rx_pd_out_gain")
         rx_ctle_en = bool(vars_map["rx_ctle_en"].get())
-        rx_ctle_dc_gain_db = float(str(vars_map["rx_ctle_dc_gain_db"].get()).strip())
-        rx_ctle_peaking_gain_db = float(str(vars_map["rx_ctle_peaking_gain_db"].get()).strip())
+        rx_ctle_dc_gain_db = _parse_float_required(
+            str(vars_map["rx_ctle_dc_gain_db"].get()),
+            f"{name}.rx_ctle_dc_gain_db",
+        )
+        rx_ctle_peaking_gain_db = _parse_float_required(
+            str(vars_map["rx_ctle_peaking_gain_db"].get()),
+            f"{name}.rx_ctle_peaking_gain_db",
+        )
         rx_ctle_peaking_freq_hz = _parse_optional_float(
             str(vars_map["rx_ctle_peaking_freq_hz"].get()),
             f"{name}.rx_ctle_peaking_freq_hz",
@@ -451,8 +490,14 @@ class LinkConfigGUI:
         )
         rx_dfe_en = bool(vars_map["rx_dfe_en"].get())
         rx_dfe_taps = _parse_csv_floats_var(str(vars_map["rx_dfe_taps"].get()), f"{name}.rx_dfe_taps")
-        rx_slicer_sensitivity = float(str(vars_map["rx_slicer_sensitivity"].get()).strip())
-        rx_slicer_aperture_ui = float(str(vars_map["rx_slicer_aperture_ui"].get()).strip())
+        rx_slicer_sensitivity = _parse_float_required(
+            str(vars_map["rx_slicer_sensitivity"].get()),
+            f"{name}.rx_slicer_sensitivity",
+        )
+        rx_slicer_aperture_ui = _parse_float_required(
+            str(vars_map["rx_slicer_aperture_ui"].get()),
+            f"{name}.rx_slicer_aperture_ui",
+        )
 
         return ControllerConfig(
             tx_data_gen_pattern=tx_data_gen_pattern,
@@ -503,7 +548,9 @@ def _get_pulse_monitor_definitions() -> dict[str, tuple[str, Callable[[Link], fl
     }
 
 
-def _resolve_pulse_monitors(monitor_points: list[str] | None) -> list[tuple[str, str, Callable[[Link], float]]]:
+def _resolve_pulse_monitors(
+    monitor_points: list[str] | None,
+) -> list[tuple[str, str, Callable[[Link], float]]]:
     defs = _get_pulse_monitor_definitions()
     if monitor_points is None:
         keys = list(defs.keys())
@@ -518,13 +565,15 @@ def _resolve_pulse_monitors(monitor_points: list[str] | None) -> list[tuple[str,
             keys.append(key)
         unknown = [k for k in keys if k not in defs]
         if unknown:
-            raise ValueError(f"Unknown pulse monitor point(s): {unknown}. Available: {list(defs.keys())}")
+            raise ValueError(
+                f"Unknown pulse monitor point(s): {unknown}. Available: {list(defs.keys())}"
+            )
     return [(k, defs[k][0], defs[k][1]) for k in keys]
 
 
 def _plot_pulse_monitor_traces(
-    t_axis_ns: np.ndarray,
-    traces: dict[str, np.ndarray],
+    t_axis_ns: npt.NDArray[np.float64],
+    traces: dict[str, npt.NDArray[np.float64]],
     monitors: list[tuple[str, str, Callable[[Link], float]]],
     title: str,
     pulse_start_ns: float,
@@ -556,7 +605,10 @@ def _plot_pulse_monitor_traces(
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
 
 
-def run_pulse_response_setup(link: Link, monitor_points: list[str] | None = None) -> dict[str, object]:
+def run_pulse_response_setup(
+    link: Link,
+    monitor_points: list[str] | None = None,
+) -> dict[str, object]:
     """
     Pulse response test setup:
     1) Victim main path: send 1 UI pulse from victim TX main driver.
@@ -671,7 +723,7 @@ def run_pulse_response_setup(link: Link, monitor_points: list[str] | None = None
             pulse_end_ns=pulse_end_ns,
         )
 
-        # Legacy summary plot for RX-in monitor.
+        # Keep legacy summary plot of victim RX-in waveforms for quick comparison.
         if "master_afe_rx_in" in main_traces_np and "slave_afe_rx_in" in main_traces_np:
             fig, axs = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
             axs[0].plot(t_axis_ns, main_traces_np["master_afe_rx_in"], label="Main pulse -> Master RX in")
@@ -791,6 +843,8 @@ def main() -> None:
         fig_ctle_fr, axs_ctle_fr = plt.subplots(2, 2, figsize=(12, 7), sharex="col")
         f_m_hz, h_m_f = link.master_rx.get_ctle_frequency_response(n_points=2048)
         f_s_hz, h_s_f = link.slave_rx.get_ctle_frequency_response(n_points=2048)
+        m_info = link.master_rx.get_ctle_design_info()
+        s_info = link.slave_rx.get_ctle_design_info()
 
         m_mask = f_m_hz > 0.0
         s_mask = f_s_hz > 0.0
@@ -820,29 +874,34 @@ def main() -> None:
                     label=label if i == 0 else None,
                 )
 
-        _add_ref_lines(ax_mm, gui_cfg.master.rx_ctle_zero_freq_hz, "tab:blue", ":", "Master zero(s)")
-        _add_ref_lines(ax_mm, gui_cfg.master.rx_ctle_pole_freq_hz, "tab:blue", "--", "Master pole(s)")
-        _add_ref_lines(ax_sm, gui_cfg.slave.rx_ctle_zero_freq_hz, "tab:orange", ":", "Slave zero(s)")
-        _add_ref_lines(ax_sm, gui_cfg.slave.rx_ctle_pole_freq_hz, "tab:orange", "--", "Slave pole(s)")
-
-        if gui_cfg.master.rx_ctle_peaking_freq_hz is not None and gui_cfg.master.rx_ctle_peaking_freq_hz > 0.0:
-            ax_mm.axvline(
-                gui_cfg.master.rx_ctle_peaking_freq_hz * 1e-9,
-                color="tab:blue",
-                linestyle="-.",
-                linewidth=1.2,
-                alpha=0.5,
-                label="Master peaking f",
-            )
-        if gui_cfg.slave.rx_ctle_peaking_freq_hz is not None and gui_cfg.slave.rx_ctle_peaking_freq_hz > 0.0:
-            ax_sm.axvline(
-                gui_cfg.slave.rx_ctle_peaking_freq_hz * 1e-9,
-                color="tab:orange",
-                linestyle="-.",
-                linewidth=1.2,
-                alpha=0.5,
-                label="Slave peaking f",
-            )
+        _add_ref_lines(
+            ax_mm,
+            [float(x) for x in np.asarray(m_info.get("zero_freq_hz_effective", []), dtype=np.float64)],
+            "tab:blue",
+            ":",
+            "Master zero(s)",
+        )
+        _add_ref_lines(
+            ax_mm,
+            [float(x) for x in np.asarray(m_info.get("pole_freq_hz_effective", []), dtype=np.float64)],
+            "tab:blue",
+            "--",
+            "Master pole(s)",
+        )
+        _add_ref_lines(
+            ax_sm,
+            [float(x) for x in np.asarray(s_info.get("zero_freq_hz_effective", []), dtype=np.float64)],
+            "tab:orange",
+            ":",
+            "Slave zero(s)",
+        )
+        _add_ref_lines(
+            ax_sm,
+            [float(x) for x in np.asarray(s_info.get("pole_freq_hz_effective", []), dtype=np.float64)],
+            "tab:orange",
+            "--",
+            "Slave pole(s)",
+        )
 
         ax_mm.set_title("Master CTLE Magnitude")
         ax_mm.set_ylabel("Magnitude (dB)")
@@ -867,8 +926,8 @@ def main() -> None:
 
         m_metrics = link.master_rx.get_ctle_response_metrics(n_points=4096)
         s_metrics = link.slave_rx.get_ctle_response_metrics(n_points=4096)
-        m_info = link.master_rx.get_ctle_design_info()
-        s_info = link.slave_rx.get_ctle_design_info()
+        print("Master CTLE mode:", m_info.get("mode"))
+        print("Slave CTLE mode:", s_info.get("mode"))
         print("Master CTLE coeff b_z:", m_info.get("b_z"))
         print("Master CTLE coeff a_z:", m_info.get("a_z"))
         print("Slave CTLE coeff b_z:", s_info.get("b_z"))
@@ -905,8 +964,8 @@ def main() -> None:
     if link.aggressor_ports:
         link.set_aggressor_sources({p: gui_cfg.aggressor_amplitude for p in link.aggressor_ports})
 
-    # Set to None to include all monitor points. Example subset:
-    # ["master_tx_main_out", "master_afe_rx_in", "master_rx_post_ctle", "master_rx_post_dfe"]
+    # Set to None to include all available pulse monitors. To use a subset, pass
+    # a list such as ["master_tx_main_out", "slave_afe_rx_in", "slave_rx_post_ctle"].
     pulse_monitor_points: list[str] | None = None
     if gui_cfg.run_pulse_response:
         run_pulse_response_setup(link, monitor_points=pulse_monitor_points)

@@ -1,0 +1,260 @@
+# Unified wireline model spec (user-editable)
+# Supports both:
+#   - dual_dir (src_py/link_model/Link)
+#   - uni_dir  (src_py_uni/uni_link_model/UniDirLink)
+
+schema_version: 1
+active_model: uni_dir   # dual_dir | uni_dir
+
+enums:
+  # Pattern values used by DataGen/Tx/UniDirLink:
+  # ALL_ZEROS, ALL_ONES, PRBS7, PRBS9, PRBS13, PRBS15, PRBS23, PRBS31
+  pattern_hint: PRBS13
+
+common:
+  channel:
+    chan_file: ./data/A1_Combined_models_Slice_C_clocks_Slice_D_Data.s10p
+    # If null, model infers [(1,2), (3,4), ...]
+    channel_pairs: [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+
+  victim_ports:
+    tx_port: 7
+    rx_port: 8
+
+  clocks:
+    tx_pi_code: 0
+    rx_pi_code: 0
+    txrx_clock_freq_hz: 16000000000.0
+    txrx_rate_mode: quarter   # full | dual | quarter
+    clk_dcd_ui: 0.0
+    clk_iq_mismatch_ui: 0.0
+    rx_clk_offset_samples: 4.0
+
+  rx_common:
+    slicer_ref_v: 0.18
+    pd_out_gain: 0.125
+    slicer_sensitivity_v: 0.0
+    slicer_aperture_ui: 0.0
+    # UI width is driven by samples_per_ui against model sample clock (256 GSa/s).
+    # Quarter-rate 64Gbps => UI ~= 15.625 ps => 4 samples/UI.
+    samples_per_ui: 4
+    eye_trace_span_ui: 2.0
+    sample_rate_hz: 256000000000.0
+
+  rx_eq:
+    ctle:
+      enable: false
+      # CTLE mode A (gain/peak mode): use dc_gain_db + peaking_gain_db + peaking_freq_hz
+      dc_gain_db: 0.0
+      peaking_gain_db: 0.0
+      peaking_freq_hz: null
+      # CTLE mode B (zero/pole mode): provide explicit arrays (same length)
+      zero_freq_hz: []
+      pole_freq_hz: []
+      logging:
+        enabled: false
+        level: INFO
+        log_response_queries: false
+    dfe:
+      enable: false
+      taps: []
+
+  aggressors:
+    enable: true
+    # null => model defaults
+    ports: null
+    source_mode: pattern   # manual | pattern
+    # Used when source_mode=manual
+    manual_sources_v: {}
+    # Used when source_mode=pattern
+    pattern_broadcast:
+      pattern: PRBS7
+      amplitude_v: 0.75
+    # Optional per-port overrides when source_mode=pattern
+    # Keys are port numbers as strings.
+    pattern_overrides:
+      "1":
+        pattern: ALL_ONES
+        amplitude_v: 0.75
+
+  eye_plot:
+    x_unit: ps        # sample | ui | s | second | ms | us | ns | ps
+    mask_type: null  # null | diamond | rectangle
+    mask_sigma: 3.0
+    interp_step: 0.1
+    use_plotly: false
+
+  diagnostics:
+    plot_path_impulses: true
+    path_impulse_time_unit: ns
+    plot_specific_aggressor_to_victim: false
+    specific_aggressor_port: 1
+    specific_victim_port: 8
+    required_coupling: FEXT   # NEXT | FEXT | null
+    pulse_time_unit: ns
+    # Runs wrapper-native DC/step + CDR PI plot cases (uni_dir).
+    run_basic_test_case_plots: true
+    # Runs the full test/plot suite from script/test_uni_feature.py when active_model=uni_dir.
+    run_uni_feature_suite: false
+    # Eye comparison plots used by test wrapper (uni_dir).
+    plot_eye_without_aggressors: true
+    plot_eye_with_aggressors: true
+    # Ensure eye capture happens after CDR PI stabilizes.
+    eye_cdr_stability:
+      require_stable: true
+      settle_cycles: 5000
+      settle_chunk_cycles: 2000
+      settle_max_extra_cycles: 10000
+      tail_edges: 1024
+      max_delta_pp: 4.0
+      max_delta_std: 1.0
+      max_unique_codes: 8
+
+dual_dir:
+  # Maps to src_py/link_model/Link + per-side Controller
+  link_init:
+    chan_port_one_sel: 7
+    chan_port_two_sel: 8
+    aggressor_ports: null
+
+  io_termination:
+    z0_ohm: 50.0
+    driver_cfg:
+      main_drv_scale_ohm: 2700.0
+      echo_drv_scale_ohm: 5400.0
+      echo_drv_series_ohm: 230.0
+    master_cfg:
+      sense_res_ohm: 160.0
+      tx_cap_f: 5.0e-14
+      rx_cap_f: 3.5e-14
+      tx_ind_h: 0.0
+      rx_ind_h: 0.0
+    slave_cfg:
+      sense_res_ohm: 160.0
+      tx_cap_f: 5.0e-14
+      rx_cap_f: 3.5e-14
+      tx_ind_h: 0.0
+      rx_ind_h: 0.0
+
+  master_controller:
+    tx_data_gen_pattern: PRBS13
+    tx_main_drv_codes: [63.0, 5.0]
+    tx_main_drv_inv_pol: [false, true]
+    tx_main_drv_en: true
+    tx_echo_drv_codes: [57.0, 7.0, 2.0]
+    tx_echo_drv_inv_pol: [true, false, false]
+    tx_echo_drv_en: true
+    tx_pi_code: 0
+    rx_clk_ofset: 4
+    rx_slc_ref: 0.375
+    rx_pd_out_gain: 0.125
+    rx_ctle_en: false
+    rx_ctle_dc_gain_db: 0.0
+    rx_ctle_peaking_gain_db: 0.0
+    rx_ctle_peaking_freq_hz: null
+    rx_ctle_zero_freq_hz: []
+    rx_ctle_pole_freq_hz: []
+    rx_dfe_en: false
+    rx_dfe_taps: []
+    rx_slicer_sensitivity: 0.0
+    rx_slicer_aperture_ui: 0.0
+
+  slave_controller:
+    tx_data_gen_pattern: PRBS13
+    tx_main_drv_codes: [63.0, 5.0]
+    tx_main_drv_inv_pol: [false, true]
+    tx_main_drv_en: true
+    tx_echo_drv_codes: [57.0, 7.0, 2.0]
+    tx_echo_drv_inv_pol: [true, false, false]
+    tx_echo_drv_en: true
+    tx_pi_code: 0
+    rx_clk_ofset: 4
+    rx_slc_ref: 0.375
+    rx_pd_out_gain: 0.0
+    rx_ctle_en: false
+    rx_ctle_dc_gain_db: 0.0
+    rx_ctle_peaking_gain_db: 0.0
+    rx_ctle_peaking_freq_hz: null
+    rx_ctle_zero_freq_hz: []
+    rx_ctle_pole_freq_hz: []
+    rx_dfe_en: false
+    rx_dfe_taps: []
+    rx_slicer_sensitivity: 0.0
+    rx_slicer_aperture_ui: 0.0
+
+uni_dir:
+  # Maps to src_py_uni/uni_link_model/UniDirLink
+  link_init:
+    chan_port_tx_sel: 7
+    chan_port_rx_sel: 8
+    tx_pattern: PRBS7
+    tx_ffe_taps: [-5, 44, -12, 2]   # [pre1, main, post1, post2]
+    # tx_ffe_taps: [0, 63.0, 0, 0]   # [pre1, main, post1, post2]
+    tx_pi_code: 0
+    rx_pi_code: 0
+    txrx_clock_freq_hz: 16000000000.0
+    txrx_rate_mode: quarter   # full | dual | quarter
+    clk_dcd_ui: 0.0
+    clk_iq_mismatch_ui: 0.0
+    rx_term_code: 63.0
+    rx_clk_ofst: 2.0
+    rx_slicer_ref: 0.15
+    rx_pd_out_gain: 0.125
+    aggressor_ports: null
+    aggressor_enable: true
+
+  rx:
+    # Overrides for link.rx object
+    ctle_en: false
+    ctle_dc_gain_db: 0.0
+    ctle_peaking_gain_db: 0.0
+    ctle_peaking_freq_hz: null
+    ctle_zero_freq_hz: []
+    ctle_pole_freq_hz: []
+    dfe_en: false
+    dfe_taps: []
+    slicer_sensitivity: 0.0
+    slicer_aperture_ui: 0.0
+    # Keep aligned with common.rx_common unless intentionally overriding.
+    samples_per_ui: 4
+    eye_trace_span_ui: 2.0
+    sample_rate_hz: 256000000000.0
+
+  io_termination:
+    z0_ohm: 50.0
+    tx_cfg:
+      drv_scale_ohm: 2700.0
+      drv_series_ohm: 0.0
+      tap_code_floor: 1.0
+      tx_cap_f: 7.5e-14
+      tx_ind_h: 0.0
+    rx_cfg:
+      term_scale_ohm: 2700.0
+      term_series_ohm: 0.0
+      term_code_gain: 1.0
+      term_code_floor: 1.0e-3
+      sense_res_ohm: 0.0
+      rx_cap_f: 3.5e-14
+      rx_ind_h: 0.0
+
+simulation:
+  random_seed: 20260305
+  deterministic_clock: false
+  num_cycles:
+    warmup: 128
+    prbs_run: 20000
+    eye_run: 35000
+    pulse_tail: 256
+
+outputs:
+  show_plots: true
+  cache:
+    enable: true
+    replay_plots: true
+    dir: artifacts/cache/specs_wrapper
+  save_figures: false
+  figure_dir: artifacts/figures
+  save_tables: false
+  table_dir: artifacts/tables
+  save_logs: false
+  log_dir: artifacts/logs
