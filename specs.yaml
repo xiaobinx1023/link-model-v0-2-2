@@ -18,8 +18,8 @@ common:
     channel_pairs: [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
 
   victim_ports:
-    tx_port: 7
-    rx_port: 8
+    tx_port: 9
+    rx_port: 10
 
   clocks:
     tx_pi_code: 0
@@ -81,15 +81,16 @@ common:
     x_unit: ps        # sample | ui | s | second | ms | us | ns | ps
     mask_type: null  # null | diamond | rectangle
     mask_sigma: 3.0
+    open_eye_shape: diamond # rectangle | diamond | arrows
     interp_step: 0.1
     use_plotly: false
 
   diagnostics:
     plot_path_impulses: true
     path_impulse_time_unit: ns
-    plot_specific_aggressor_to_victim: false
-    specific_aggressor_port: 1
-    specific_victim_port: 8
+    plot_specific_aggressor_to_victim: true
+    specific_aggressor_port: 5
+    specific_victim_port: 10
     required_coupling: FEXT   # NEXT | FEXT | null
     pulse_time_unit: ns
     # Runs wrapper-native DC/step + CDR PI plot cases (uni_dir).
@@ -185,17 +186,17 @@ dual_dir:
 uni_dir:
   # Maps to src_py_uni/uni_link_model/UniDirLink
   link_init:
-    chan_port_tx_sel: 7
-    chan_port_rx_sel: 8
-    tx_pattern: PRBS7
-    tx_ffe_taps: [-5, 44, -12, 2]   # [pre1, main, post1, post2]
+    chan_port_tx_sel: 9
+    chan_port_rx_sel: 10
+    tx_pattern: PRBS13
+    tx_ffe_taps: [-5, 44, -12, 4]   # [pre1, main, post1, post2]
     # tx_ffe_taps: [0, 63.0, 0, 0]   # [pre1, main, post1, post2]
     tx_pi_code: 0
     rx_pi_code: 0
     txrx_clock_freq_hz: 16000000000.0
     txrx_rate_mode: quarter   # full | dual | quarter
-    clk_dcd_ui: 0.0
-    clk_iq_mismatch_ui: 0.0
+    clk_dcd_ui: 0.1
+    clk_iq_mismatch_ui: 0.1
     rx_term_code: 63.0
     rx_clk_ofst: 2.0
     rx_slicer_ref: 0.15

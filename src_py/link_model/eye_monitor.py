@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 from typing import Any, List, Optional
@@ -14,7 +16,7 @@ from .clock import Clock
 
 
 class EyeMonitor:
-    def __init__(self, num_traces: int = 1024, num_samples_per_trace: int = 16) -> None:
+    def __init__(self, num_traces: int = 4096, num_samples_per_trace: int = 16) -> None:
         self.clk_in = Clock()
         self.data_in = 0.0
 
@@ -239,12 +241,16 @@ class EyeMonitor:
                 "x_center": self._num_samples_per_trace / 2.0,
                 "upper_amp_mean": None,
                 "upper_amp_std": None,
+                "upper_amp_min": None,
                 "lower_amp_mean": None,
                 "lower_amp_std": None,
+                "lower_amp_max": None,
                 "left_edge_mean": None,
                 "left_edge_std": None,
+                "left_edge_inner": None,
                 "right_edge_mean": None,
                 "right_edge_std": None,
+                "right_edge_inner": None,
                 "left_margin_mean": None,
                 "left_margin_std": None,
                 "right_margin_mean": None,
@@ -261,7 +267,26 @@ class EyeMonitor:
             }, 0)
 
         y_all = np.vstack(interp_traces)
-        x_center_ref = self._num_samples_per_trace / 2.0
+
+        rough_threshold = float(np.median(y_all))
+        above = y_all >= rough_threshold
+        below = ~above
+        n_above = above.sum(axis=0)
+        n_below = below.sum(axis=0)
+        both_present = (n_above > 0) & (n_below > 0)
+        inner_opening = np.full(y_all.shape[1], -np.inf)
+        for col in np.where(both_present)[0]:
+            col_vals = y_all[:, col]
+            upper_min_col = float(np.min(col_vals[col_vals >= rough_threshold]))
+            lower_max_col = float(np.max(col_vals[col_vals < rough_threshold]))
+            inner_opening[col] = upper_min_col - lower_max_col
+
+        if np.any(inner_opening > 0):
+            best_col = int(np.argmax(inner_opening))
+            x_center_ref = float(x_grid[best_col])
+        else:
+            x_center_ref = self._num_samples_per_trace / 2.0
+
         center_idx = int(np.argmin(np.abs(x_grid - x_center_ref)))
         center_vals = y_all[:, center_idx]
 
@@ -278,12 +303,16 @@ class EyeMonitor:
                 "x_center": float(x_center_ref),
                 "upper_amp_mean": None,
                 "upper_amp_std": None,
+                "upper_amp_min": None,
                 "lower_amp_mean": None,
                 "lower_amp_std": None,
+                "lower_amp_max": None,
                 "left_edge_mean": None,
                 "left_edge_std": None,
+                "left_edge_inner": None,
                 "right_edge_mean": None,
                 "right_edge_std": None,
+                "right_edge_inner": None,
                 "left_margin_mean": None,
                 "left_margin_std": None,
                 "right_margin_mean": None,
@@ -301,8 +330,10 @@ class EyeMonitor:
 
         upper_amp_mean = float(np.mean(high_vals))
         upper_amp_std = float(np.std(high_vals))
+        upper_amp_min = float(np.min(high_vals))
         lower_amp_mean = float(np.mean(low_vals))
         lower_amp_std = float(np.std(low_vals))
+        lower_amp_max = float(np.max(low_vals))
         eye_height_mean = upper_amp_mean - lower_amp_mean
         eye_height_std = float(np.sqrt(upper_amp_std**2 + lower_amp_std**2))
 
@@ -405,8 +436,10 @@ class EyeMonitor:
 
             left_edge_mean_local = float(np.mean(left_edges_local)) if left_edges_local else None
             left_edge_std_local = float(np.std(left_edges_local)) if left_edges_local else None
+            left_edge_inner_local = float(np.max(left_edges_local)) if left_edges_local else None
             right_edge_mean_local = float(np.mean(right_edges_local)) if right_edges_local else None
             right_edge_std_local = float(np.std(right_edges_local)) if right_edges_local else None
+            right_edge_inner_local = float(np.min(right_edges_local)) if right_edges_local else None
 
             left_margins_local = [center_val - left for left in left_edges_local]
             right_margins_local = [right - center_val for right in right_edges_local]
@@ -418,8 +451,10 @@ class EyeMonitor:
             return (
                 left_edge_mean_local,
                 left_edge_std_local,
+                left_edge_inner_local,
                 right_edge_mean_local,
                 right_edge_std_local,
+                right_edge_inner_local,
                 left_margin_mean_local,
                 left_margin_std_local,
                 right_margin_mean_local,
@@ -429,8 +464,10 @@ class EyeMonitor:
         (
             left_edge_mean,
             left_edge_std,
+            left_edge_inner,
             right_edge_mean,
             right_edge_std,
+            right_edge_inner,
             left_margin_mean,
             left_margin_std,
             right_margin_mean,
@@ -443,8 +480,10 @@ class EyeMonitor:
             (
                 left_edge_mean,
                 left_edge_std,
+                left_edge_inner,
                 right_edge_mean,
                 right_edge_std,
+                right_edge_inner,
                 left_margin_mean,
                 left_margin_std,
                 right_margin_mean,
@@ -467,12 +506,16 @@ class EyeMonitor:
             "x_center": float(x_center),
             "upper_amp_mean": upper_amp_mean,
             "upper_amp_std": upper_amp_std,
+            "upper_amp_min": upper_amp_min,
             "lower_amp_mean": lower_amp_mean,
             "lower_amp_std": lower_amp_std,
+            "lower_amp_max": lower_amp_max,
             "left_edge_mean": left_edge_mean,
             "left_edge_std": left_edge_std,
+            "left_edge_inner": left_edge_inner,
             "right_edge_mean": right_edge_mean,
             "right_edge_std": right_edge_std,
+            "right_edge_inner": right_edge_inner,
             "left_margin_mean": left_margin_mean,
             "left_margin_std": left_margin_std,
             "right_margin_mean": right_margin_mean,
@@ -528,11 +571,25 @@ class EyeMonitor:
 
     @staticmethod
     def _internal_open_geometry(metrics: dict[str, Any]) -> Optional[tuple[float, float, float, float]]:
-        """Return internal open-eye geometry from measured mean eye statistics."""
-        left = metrics.get("left_edge_mean")
-        right = metrics.get("right_edge_mean")
-        lower = metrics.get("lower_amp_mean")
-        upper = metrics.get("upper_amp_mean")
+        """Return internal open-eye geometry from worst-case inner trace boundaries.
+
+        Uses the innermost crossing/amplitude across all captured traces:
+        left  = max of per-trace left edges  (rightmost left boundary)
+        right = min of per-trace right edges  (leftmost right boundary)
+        lower = max of per-trace lower amps   (highest floor)
+        upper = min of per-trace upper amps   (lowest ceiling)
+        Falls back to mean values when inner-boundary fields are unavailable.
+        """
+        def _pick(primary_key: str, fallback_key: str):
+            v = metrics.get(primary_key)
+            if v is not None:
+                return v
+            return metrics.get(fallback_key)
+
+        left = _pick("left_edge_inner", "left_edge_mean")
+        right = _pick("right_edge_inner", "right_edge_mean")
+        lower = _pick("lower_amp_max", "lower_amp_mean")
+        upper = _pick("upper_amp_min", "upper_amp_mean")
         if left is None or right is None or lower is None or upper is None:
             return None
         x_left = float(left)
@@ -543,13 +600,171 @@ class EyeMonitor:
             return None
         return x_left, x_right, y_bot, y_top
 
+    def _compute_inner_eye_boundary(
+        self,
+        x_grid: npt.NDArray[np.float64],
+        interp_traces: list[npt.NDArray[np.float64]],
+    ) -> Optional[tuple[float, float, float, float]]:
+        """Compute open-eye marker geometry from the widest opening within 1.5 UI.
+
+        Eye-width selection:
+        - Search eye-center candidates inside the central 1.5 UI window.
+        - For each candidate, width is the inner opening from threshold crossings:
+          ``x_right_inner - x_left_inner`` where
+          ``x_left_inner = max(left_cross_i)`` and
+          ``x_right_inner = min(right_cross_i)`` across traces.
+        - Choose the candidate with the maximum positive width.
+
+        Eye-height definition at the chosen center:
+        - ``upper_min_amplitude = min(values of class "1")``
+        - ``lower_max_amplitude = max(values of class "0")``
+        - ``eye_height = upper_min_amplitude - lower_max_amplitude``
+        where classing uses the global-median threshold.
+        """
+        if len(interp_traces) < 2:
+            return None
+        y_all = np.vstack(interp_traces)
+        n_traces, n_cols = y_all.shape
+        if n_traces < 2 or n_cols < 2:
+            return None
+
+        x_min = float(x_grid[0])
+        x_max = float(x_grid[-1])
+        x_span = max(x_max - x_min, 1e-12)
+
+        # Restrict search to the central 1.5 UI region within the trace span.
+        span_ui = float(max(self._trace_span_ui, 1e-12))
+        search_ratio = min(1.0, 1.5 / span_ui)
+        search_span_x = x_span * search_ratio
+        x_center_nom = 0.5 * (x_min + x_max)
+        x_lo = x_center_nom - 0.5 * search_span_x
+        x_hi = x_center_nom + 0.5 * search_span_x
+        candidate_cols = np.where((x_grid >= x_lo) & (x_grid <= x_hi))[0]
+        if candidate_cols.size == 0:
+            candidate_cols = np.arange(n_cols, dtype=int)
+
+        # Build a global 0/1 threshold from low/high rails.
+        low_ref = float(np.percentile(y_all, 10.0))
+        high_ref = float(np.percentile(y_all, 90.0))
+        threshold = 0.5 * (low_ref + high_ref)
+        if not np.isfinite(threshold):
+            threshold = float(np.median(y_all))
+
+        # Build per-column inner envelope using the fixed 0/1 threshold.
+        y_top_col = np.full(n_cols, -np.inf, dtype=np.float64)
+        y_bot_col = np.full(n_cols, np.inf, dtype=np.float64)
+        h_col = np.full(n_cols, -np.inf, dtype=np.float64)
+        for ci in candidate_cols:
+            col = y_all[:, int(ci)]
+            hi = col[col >= threshold]
+            lo = col[col < threshold]
+            if hi.size == 0 or lo.size == 0:
+                continue
+            y_top = float(np.min(hi))
+            y_bot = float(np.max(lo))
+            h = y_top - y_bot
+            if h > 0.0:
+                y_top_col[int(ci)] = y_top
+                y_bot_col[int(ci)] = y_bot
+                h_col[int(ci)] = h
+
+        valid_cols = candidate_cols[np.isfinite(h_col[candidate_cols]) & (h_col[candidate_cols] > 0.0)]
+        if valid_cols.size == 0:
+            return None
+        valid_h = h_col[valid_cols]
+        max_h = float(np.max(valid_h))
+        if not np.isfinite(max_h) or max_h <= 0.0:
+            return None
+
+        # Choose a stable eye core (avoid stitching adjacent eyes through tiny residual openings).
+        core_thresh = max(1e-12, 0.35 * max_h)
+        core_mask = np.isfinite(h_col) & (h_col >= core_thresh)
+        core_mask &= np.isin(np.arange(n_cols), candidate_cols)
+        if not np.any(core_mask):
+            core_mask = np.isfinite(h_col) & (h_col > 0.0) & np.isin(np.arange(n_cols), candidate_cols)
+        core_idx = np.where(core_mask)[0]
+        if core_idx.size == 0:
+            return None
+        runs: list[tuple[int, int]] = []
+        run_start = int(core_idx[0])
+        prev = int(core_idx[0])
+        for k in core_idx[1:]:
+            kk = int(k)
+            if kk == prev + 1:
+                prev = kk
+                continue
+            runs.append((run_start, prev))
+            run_start = kk
+            prev = kk
+        runs.append((run_start, prev))
+        best_run = max(
+            runs,
+            key=lambda r: (
+                float(x_grid[r[1]] - x_grid[r[0]]),
+                float(-abs(0.5 * (x_grid[r[0]] + x_grid[r[1]]) - x_center_nom)),
+            ),
+        )
+        core_run = np.arange(int(best_run[0]), int(best_run[1]) + 1, dtype=int)
+        ci = int(core_run[np.argmax(h_col[core_run])])
+
+        # Eye width = local open span around selected core, bounded by low opening threshold.
+        candidate_lo = int(np.min(candidate_cols))
+        candidate_hi = int(np.max(candidate_cols))
+        edge_thresh = max(1e-12, 0.05 * max_h)
+        open_mask = np.isfinite(h_col) & (h_col > edge_thresh)
+
+        i0 = ci
+        while i0 > candidate_lo and bool(open_mask[i0 - 1]):
+            i0 -= 1
+        i1 = ci
+        while i1 < candidate_hi and bool(open_mask[i1 + 1]):
+            i1 += 1
+
+        x_left = float(x_grid[i0])
+        if i0 > candidate_lo and np.isfinite(h_col[i0 - 1]) and np.isfinite(h_col[i0]):
+            h0 = float(h_col[i0 - 1])
+            h1 = float(h_col[i0])
+            if h0 <= edge_thresh < h1 and h1 != h0:
+                x0 = float(x_grid[i0 - 1])
+                x1 = float(x_grid[i0])
+                x_left = float(x0 + (edge_thresh - h0) * (x1 - x0) / (h1 - h0))
+
+        x_right = float(x_grid[i1])
+        if i1 < candidate_hi and np.isfinite(h_col[i1]) and np.isfinite(h_col[i1 + 1]):
+            h0 = float(h_col[i1])
+            h1 = float(h_col[i1 + 1])
+            if h0 > edge_thresh >= h1 and h1 != h0:
+                x0 = float(x_grid[i1])
+                x1 = float(x_grid[i1 + 1])
+                x_right = float(x0 + (edge_thresh - h0) * (x1 - x0) / (h1 - h0))
+
+        if x_right <= x_left:
+            return None
+
+        # Eye height at selected center: upper_min("1") - lower_max("0").
+        y_top = float(y_top_col[ci])
+        y_bot = float(y_bot_col[ci])
+        if not (np.isfinite(y_top) and np.isfinite(y_bot) and y_top > y_bot):
+            return None
+        return x_left, x_right, y_bot, y_top
+
     @staticmethod
     def _draw_internal_open_markers_matplotlib(
         ax: Axes,
         geometry: tuple[float, float, float, float],
+        shape: str = "diamond",
         color: str = "darkorange",
     ) -> None:
-        """Draw internal eye-width and eye-height markers on a matplotlib axis."""
+        """Draw internal open-eye boundary on a matplotlib axis.
+
+        Parameters
+        ----------
+        shape : str
+            ``"diamond"`` draws a diamond mask outline,
+            ``"rectangle"`` draws a rectangular mask outline,
+            ``"arrows"`` draws the legacy double-arrow annotation style.
+        """
+        from matplotlib.patches import Polygon as MplPolygon
         x_left, x_right, y_bot, y_top = geometry
         width = x_right - x_left
         height = y_top - y_bot
@@ -565,23 +780,43 @@ class EyeMonitor:
         y_off = 0.02 * y_span
         x_off = 0.02 * x_span
 
-        ax.annotate(
-            "",
-            xy=(x_left, y_bot),
-            xytext=(x_right, y_bot),
-            arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
-        )
-        ax.annotate(
-            "",
-            xy=(x_center, y_bot),
-            xytext=(x_center, y_top),
-            arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
-        )
+        if shape == "diamond":
+            verts = [
+                (x_center, y_top),
+                (x_right, y_center),
+                (x_center, y_bot),
+                (x_left, y_center),
+                (x_center, y_top),
+            ]
+            patch = MplPolygon(
+                verts, closed=True, fill=False,
+                edgecolor=color, linewidth=1.8, alpha=0.9, linestyle="-",
+            )
+            ax.add_patch(patch)
+        elif shape == "rectangle":
+            ax.add_patch(plt.Rectangle(
+                (x_left, y_bot), width, height,
+                fill=False, edgecolor=color, linewidth=1.8, alpha=0.9, linestyle="-",
+            ))
+        else:
+            ax.annotate(
+                "",
+                xy=(x_left, y_center),
+                xytext=(x_right, y_center),
+                arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
+            )
+            ax.annotate(
+                "",
+                xy=(x_center, y_bot),
+                xytext=(x_center, y_top),
+                arrowprops=dict(arrowstyle="<->", color=color, lw=1.3, alpha=0.9),
+            )
+
         ax.plot([x_center], [y_center], marker="x", color=color, markersize=6, markeredgewidth=1.4)
         ax.text(
             x_center,
             y_bot - y_off,
-            f"Eye Width: {width:.3f}",
+            f"Open Eye Width: {width:.3f}",
             color=color,
             ha="center",
             va="top",
@@ -590,11 +825,11 @@ class EyeMonitor:
         )
         ax.text(
             x_center + x_off,
-            y_center,
-            f"Eye Height: {height:.3f}",
+            y_top + y_off,
+            f"Open Eye Height: {height:.3f}",
             color=color,
             ha="left",
-            va="center",
+            va="bottom",
             fontsize=9,
             bbox=dict(facecolor="white", edgecolor=color, alpha=0.85, boxstyle="round,pad=0.2"),
         )
@@ -603,9 +838,16 @@ class EyeMonitor:
     def _draw_internal_open_markers_plotly(
         fig,
         geometry: tuple[float, float, float, float],
+        shape: str = "diamond",
         color: str = "darkorange",
     ) -> None:
-        """Draw internal eye-width and eye-height markers on a Plotly figure."""
+        """Draw internal open-eye boundary on a Plotly figure.
+
+        Parameters
+        ----------
+        shape : str
+            ``"diamond"``, ``"rectangle"``, or ``"arrows"`` (legacy).
+        """
         x_left, x_right, y_bot, y_top = geometry
         width = x_right - x_left
         height = y_top - y_bot
@@ -614,87 +856,53 @@ class EyeMonitor:
 
         x_center = 0.5 * (x_left + x_right)
         y_center = 0.5 * (y_bot + y_top)
+
+        if shape == "diamond":
+            fig.add_shape(
+                type="path",
+                path=(
+                    f"M {x_center},{y_top} "
+                    f"L {x_right},{y_center} "
+                    f"L {x_center},{y_bot} "
+                    f"L {x_left},{y_center} Z"
+                ),
+                line=dict(color=color, width=1.8),
+                fillcolor="rgba(255,165,0,0.08)",
+            )
+        elif shape == "rectangle":
+            fig.add_shape(
+                type="rect",
+                x0=x_left, y0=y_bot, x1=x_right, y1=y_top,
+                line=dict(color=color, width=1.8),
+                fillcolor="rgba(255,165,0,0.08)",
+            )
+        else:
+            for pt_x, pt_y, ax_x, ax_y in [
+                (x_left, y_center, x_right, y_center),
+                (x_right, y_center, x_left, y_center),
+                (x_center, y_bot, x_center, y_top),
+                (x_center, y_top, x_center, y_bot),
+            ]:
+                fig.add_annotation(
+                    x=pt_x, y=pt_y, ax=ax_x, ay=ax_y,
+                    xref="x", yref="y", axref="x", ayref="y",
+                    showarrow=True, arrowhead=3, arrowsize=1,
+                    arrowwidth=1.4, arrowcolor=color,
+                )
+
         fig.add_annotation(
-            x=x_left,
-            y=y_bot,
-            ax=x_right,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_right,
-            y=y_bot,
-            ax=x_left,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_bot,
-            ax=x_center,
-            ay=y_top,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_top,
-            ax=x_center,
-            ay=y_bot,
-            xref="x",
-            yref="y",
-            axref="x",
-            ayref="y",
-            showarrow=True,
-            arrowhead=3,
-            arrowsize=1,
-            arrowwidth=1.4,
-            arrowcolor=color,
-        )
-        fig.add_annotation(
-            x=x_center,
-            y=y_bot,
-            yshift=-14,
-            text=f"Eye Width: {width:.3f}",
-            showarrow=False,
-            font=dict(color=color),
+            x=x_center, y=y_center, yshift=-14,
+            text=f"Open Eye Width: {width:.3f}",
+            showarrow=False, font=dict(color=color),
             bgcolor="rgba(255,255,255,0.85)",
-            bordercolor=color,
-            borderwidth=1,
+            bordercolor=color, borderwidth=1,
         )
         fig.add_annotation(
-            x=x_center,
-            y=y_center,
-            xshift=24,
-            text=f"Eye Height: {height:.3f}",
-            showarrow=False,
-            font=dict(color=color),
+            x=x_center, y=y_top, xshift=24, yshift=10,
+            text=f"Open Eye Height: {height:.3f}",
+            showarrow=False, font=dict(color=color),
             bgcolor="rgba(255,255,255,0.85)",
-            bordercolor=color,
-            borderwidth=1,
+            bordercolor=color, borderwidth=1,
         )
 
     @staticmethod
@@ -721,13 +929,14 @@ class EyeMonitor:
                 linewidth=2,
             )
         elif mask_type == "diamond":
+            diamond_vertices = [
+                (x_center, y_center + mask_h / 2.0),
+                (x_center + mask_w / 2.0, y_center),
+                (x_center, y_center - mask_h / 2.0),
+                (x_center - mask_w / 2.0, y_center),
+            ]
             patch = mpatches.Polygon(
-                [
-                    (x_center, y_center + mask_h / 2.0),
-                    (x_center + mask_w / 2.0, y_center),
-                    (x_center, y_center - mask_h / 2.0),
-                    (x_center - mask_w / 2.0, y_center),
-                ],
+                diamond_vertices,
                 closed=True,
                 edgecolor=color,
                 facecolor=(1, 0, 0, 0.05),
@@ -736,6 +945,19 @@ class EyeMonitor:
         else:
             return
         ax.add_patch(patch)
+        if mask_type == "diamond":
+            vx, vy = zip(*diamond_vertices)
+            ax.plot(
+                vx,
+                vy,
+                linestyle="None",
+                marker="o",
+                markersize=4.5,
+                markerfacecolor="white",
+                markeredgecolor=color,
+                markeredgewidth=1.2,
+                alpha=0.95,
+            )
 
     @staticmethod
     def _label_mask_matplotlib(
@@ -867,6 +1089,7 @@ class EyeMonitor:
         interp_step: float = 0.1,
         x_unit: str = "ui",
         show_internal_open_markers: bool = True,
+        open_eye_shape: str = "diamond",
         return_metrics: bool = False,
     ):
         if ax is None:
@@ -892,10 +1115,13 @@ class EyeMonitor:
         if metrics.get("x_center") is not None:
             metrics["x_center_in_unit"] = float(metrics["x_center"]) * float(x_scale)
         if bool(show_internal_open_markers):
-            open_geom = self._internal_open_geometry(metrics)
+            open_geom = self._compute_inner_eye_boundary(x_grid, interp_traces)
             if open_geom is not None:
                 open_geom_plot = self._scale_mask_x(open_geom, x_scale=float(x_scale))
-                self._draw_internal_open_markers_matplotlib(ax, open_geom_plot)
+                self._draw_internal_open_markers_matplotlib(ax, open_geom_plot, shape=open_eye_shape)
+                eye_center_sample = 0.5 * (open_geom[0] + open_geom[1])
+                metrics["x_center"] = float(eye_center_sample)
+                metrics["x_center_in_unit"] = float(eye_center_sample) * float(x_scale)
                 metrics["internal_open_geometry"] = {
                     "x_left": float(open_geom_plot[0]),
                     "x_right": float(open_geom_plot[1]),
@@ -929,6 +1155,7 @@ class EyeMonitor:
         interp_step: float = 0.1,
         x_unit: str = "ui",
         show_internal_open_markers: bool = True,
+        open_eye_shape: str = "diamond",
         show: bool = True,
     ):
         try:
@@ -957,10 +1184,13 @@ class EyeMonitor:
         if metrics.get("x_center") is not None:
             metrics["x_center_in_unit"] = float(metrics["x_center"]) * float(x_scale)
         if bool(show_internal_open_markers):
-            open_geom = self._internal_open_geometry(metrics)
+            open_geom = self._compute_inner_eye_boundary(x_grid, interp_traces)
             if open_geom is not None:
                 open_geom_plot = self._scale_mask_x(open_geom, x_scale=float(x_scale))
-                self._draw_internal_open_markers_plotly(fig, open_geom_plot)
+                self._draw_internal_open_markers_plotly(fig, open_geom_plot, shape=open_eye_shape)
+                eye_center_sample = 0.5 * (open_geom[0] + open_geom[1])
+                metrics["x_center"] = float(eye_center_sample)
+                metrics["x_center_in_unit"] = float(eye_center_sample) * float(x_scale)
                 metrics["internal_open_geometry"] = {
                     "x_left": float(open_geom_plot[0]),
                     "x_right": float(open_geom_plot[1]),
@@ -1000,7 +1230,8 @@ class EyeMonitor:
                         line=dict(color="crimson", width=2),
                         fillcolor="rgba(220, 20, 60, 0.08)",
                     )
-                self._label_mask_plotly(fig, geometry, stat_line=stat_line)
+                geometry_plot = (x0, x1, y0, y1)
+                self._label_mask_plotly(fig, geometry_plot, stat_line=stat_line)
             metrics["mask_sigma_requested"] = float(mask_sigma)
             metrics["mask_sigma_effective"] = float(effective_sigma)
             metrics["mask_sigma_trace_limited"] = bool(sigma_limited)

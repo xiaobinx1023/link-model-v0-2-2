@@ -220,41 +220,63 @@ def run_1ui_pulse_response(
     monitor_keys: list[str] | None = None,
 ) -> dict[str, object]:
     """
-    Force a 1-UI pulse at TX by toggling ALL_ZEROS/ALL_ONES around one UI window.
+    Force a 1-UI pulse at TX in data-edge domain (robust to IQ/DCD phase skew).
     """
     monitors = _resolve_monitor_keys(monitor_keys)
 
     ui_samples = _get_data_ui_samples(link)
-    warmup = 128
-    pulse_len = ui_samples
-    tail = 256
-    total_cycles = warmup + pulse_len + tail
-    pulse_start = warmup
-    pulse_end = warmup + pulse_len
-
-    t_ns = np.arange(total_cycles, dtype=np.float64) / link.SAMP_FREQ_HZ * 1e9
-    pulse_start_ns = pulse_start / link.SAMP_FREQ_HZ * 1e9
-    pulse_end_ns = pulse_end / link.SAMP_FREQ_HZ * 1e9
+    warmup_samples = 128
+    tail_samples = 256
+    warmup_edges = max(1, int(round(float(warmup_samples) / float(max(1, ui_samples)))))
+    pulse_edges = 1
+    # Guarded upper bound so we do not loop indefinitely if clocking is malformed.
+    max_cycles = warmup_samples + tail_samples + max(64, 12 * max(1, ui_samples))
 
     saved_pattern = Pattern(link.tx_pattern)
     saved_aggr_enable = bool(link.aggressor_enable)
     saved_aggr_src = dict(link.aggressor_port_src)
     traces_raw: dict[str, list[float]] = {k: [] for k, _, _ in monitors}
+    edge_count = 0
+    pulse_start: int | None = None
+    pulse_end: int | None = None
 
     try:
         link.set_aggressor_enable(False)
         if link.aggressor_ports:
             link.set_aggressor_sources({p: 0.0 for p in link.aggressor_ports})
-        for t in range(total_cycles):
-            link.tx_pattern = Pattern.ALL_ONES if pulse_start <= t < pulse_end else Pattern.ALL_ZEROS
+        for t in range(max_cycles):
+            in_pulse_symbol = warmup_edges <= edge_count < (warmup_edges + pulse_edges)
+            link.tx_pattern = Pattern.ALL_ONES if in_pulse_symbol else Pattern.ALL_ZEROS
             link.run()
             for key, _, getter in monitors:
                 traces_raw[key].append(float(getter(link)))
+
+            if bool(link.tx_clk_out.is_pos_edge):
+                if edge_count == warmup_edges and pulse_start is None:
+                    pulse_start = int(t)
+                if edge_count == (warmup_edges + pulse_edges) and pulse_end is None:
+                    pulse_end = int(t)
+                edge_count += 1
+
+            if pulse_end is not None and t >= int(pulse_end + tail_samples):
+                break
     finally:
         link.tx_pattern = saved_pattern
         link.set_aggressor_enable(saved_aggr_enable)
         if link.aggressor_ports:
             link.set_aggressor_sources({p: float(saved_aggr_src.get(p, 0.0)) for p in link.aggressor_ports})
+
+    n_samp = len(next(iter(traces_raw.values()))) if len(traces_raw) > 0 else 0
+    if pulse_start is None:
+        pulse_start = min(max(0, warmup_samples), max(0, n_samp - 1))
+    if pulse_end is None:
+        pulse_end = min(max(0, pulse_start + max(1, ui_samples)), max(1, n_samp))
+    pulse_start = int(max(0, min(pulse_start, max(0, n_samp - 1))))
+    pulse_end = int(max(pulse_start + 1, min(pulse_end, max(1, n_samp))))
+
+    t_ns = np.arange(n_samp, dtype=np.float64) / link.SAMP_FREQ_HZ * 1e9
+    pulse_start_ns = float(pulse_start) / link.SAMP_FREQ_HZ * 1e9
+    pulse_end_ns = float(pulse_end) / link.SAMP_FREQ_HZ * 1e9
 
     traces = {k: np.asarray(v, dtype=np.float64) for k, v in traces_raw.items()}
     monitor_order = [k for k, _, _ in monitors]

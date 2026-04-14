@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 import argparse
@@ -1109,6 +1111,7 @@ def _run_uni_sim(
         m = mask_type.strip().lower()
         if m in {"", "none", "null"}:
             mask_type = None
+    open_eye_shape = str(eye_plot.get("open_eye_shape", "diamond")).strip().lower()
 
     if show_plots and len(eye_cases) > 0:
         fig_eye, ax_eye = plt.subplots(1, len(eye_cases), figsize=(7.2 * len(eye_cases), 4), squeeze=False)
@@ -1118,6 +1121,7 @@ def _run_uni_sim(
                 mask_type=mask_type,
                 mask_sigma=mask_sigma,
                 x_unit=x_unit,
+                open_eye_shape=open_eye_shape,
                 return_metrics=True,
             )
             xc = float(eye_metrics.get("x_center_in_unit", eye_metrics.get("x_center", float("nan"))))
@@ -1407,3 +1411,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
